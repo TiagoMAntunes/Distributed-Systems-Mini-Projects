@@ -59,7 +59,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	}
 	nReduce = count
 
-	fmt.Println("I am id ", id)
+	//fmt.Println("I am id ", id)
 
 	for {
 		task, wait, ok := workRequest(id)
@@ -69,7 +69,12 @@ func Worker(mapf func(string, string) []KeyValue,
 
 		// do work
 		if !wait {
-			work(task, mapf, reducef)
+			if task.JobType == MAP {
+				doMap(task, mapf)
+			} else {
+				doReduce(task, reducef)
+			}
+			// work(task, mapf, reducef)
 
 			ok := submitJob(id, task.Filename)
 			if !ok {
@@ -77,71 +82,123 @@ func Worker(mapf func(string, string) []KeyValue,
 			}
 
 		} else {
-			fmt.Println("Waiting...")
+			//fmt.Println("Waiting...")
 			time.Sleep(time.Second * 3)
 		}
 
 	}
 
 }
+func doReduce(task Job, reducef func(string, []string) string) {
+	files := make([]*os.File, task.MapCount)
+	decoders := make([]*json.Decoder, task.MapCount)
 
-func work(task Job, mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
-	// TODO real work
-	if task.JobType == MAP {
-		// do map
-		file, err := os.Open(task.Filename)
-		if err != nil {
+	// open all map intermediate files
+	for i := 0; i < task.MapCount; i++ {
+		file, ok := os.Open(fmt.Sprintf("mr-%v-%v", i, task.ID))
+		if ok != nil {
 			log.Fatalf("cannot open %v", task.Filename)
 		}
 
-		content, err := ioutil.ReadAll(file)
-		if err != nil {
-			log.Fatalf("cannot read %v", task.Filename)
-		}
+		files[i] = file
+		decoders[i] = json.NewDecoder(file)
+	}
 
-		file.Close()
+	kva := []KeyValue{}
 
-		kva := mapf(task.Filename, string(content))
-
-		// sort the obtained keys
-		sort.Sort(ByKey(kva))
-
-		// create temporary files
-		files := make([]*os.File, nReduce)
-		encoders := make([]*json.Encoder, nReduce)
-		for i := 0; i < nReduce; i++ {
-			name := fmt.Sprintf("mr-%v-%v*", task.ID, i)
-			tmpfile, ok := ioutil.TempFile(".", name)
-			if ok != nil {
-				log.Fatalf("cannot open temp file %v", name)
+	// read all data
+	for i := 0; i < task.MapCount; i++ {
+		dec := decoders[i]
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
 			}
+			kva = append(kva, kv)
+		}
+	}
 
-			files[i] = tmpfile
-			encoders[i] = json.NewEncoder(tmpfile)
+	// sort the obtained keys
+	sort.Sort(ByKey(kva))
+
+	oname := fmt.Sprintf("mr-out-%v", task.ID)
+	ofile, ok := os.Create(oname)
+	if ok != nil {
+		log.Fatalf("cannot open %v", oname)
+	}
+
+	//
+	// call Reduce on each distinct key in intermediate[],
+	// and print the result to mr-out-0.
+	//
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+		i = j
+	}
+
+	ofile.Close()
+
+}
+
+func doMap(task Job, mapf func(string, string) []KeyValue) {
+	// do map
+	file, err := os.Open(task.Filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", task.Filename)
+	}
+
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", task.Filename)
+	}
+
+	file.Close()
+
+	kva := mapf(task.Filename, string(content))
+
+	// create temporary files
+	files := make([]*os.File, nReduce)
+	encoders := make([]*json.Encoder, nReduce)
+	for i := 0; i < nReduce; i++ {
+		name := fmt.Sprintf("mr-%v-%v*", task.ID, i)
+		tmpfile, ok := ioutil.TempFile(".", name)
+		if ok != nil {
+			log.Fatalf("cannot open temp file %v", name)
 		}
 
-		// write keys to each temporary file
-		for _, kv := range kva {
-			i := ihash(kv.Key) % nReduce
-			encoders[i].Encode(&kv)
+		files[i] = tmpfile
+		encoders[i] = json.NewEncoder(tmpfile)
+	}
+
+	// write keys to each temporary file
+	for _, kv := range kva {
+		i := ihash(kv.Key) % nReduce
+		encoders[i].Encode(&kv)
+	}
+
+	// close all files and rename them
+	for i := 0; i < nReduce; i++ {
+		oldname := files[i].Name()
+		files[i].Close()
+
+		newname := fmt.Sprintf("mr-%v-%v", task.ID, i)
+		ok := os.Rename(oldname, newname)
+		if ok != nil {
+			log.Fatalf("cannot rename temp file %v", oldname)
 		}
-
-		// close all files and rename them
-		for i := 0; i < nReduce; i++ {
-			oldname := files[i].Name()
-			files[i].Close()
-
-			newname := fmt.Sprintf("mr-%v-%v", task.ID, i)
-			ok := os.Rename(oldname, newname)
-			if ok != nil {
-				log.Fatalf("cannot rename temp file %v", oldname)
-			}
-		}
-
-	} else {
-		// do reduce
-		// TODO
 	}
 }
 
@@ -214,6 +271,6 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 		return true
 	}
 
-	fmt.Println(err)
+	//fmt.Println(err)
 	return false
 }

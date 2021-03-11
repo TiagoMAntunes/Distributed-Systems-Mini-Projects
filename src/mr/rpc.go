@@ -58,6 +58,7 @@ type Job struct {
 	JobType  int // MAP or REDUCE
 	Filename string
 	ID       int
+	MapCount int // this is for each reduce job
 }
 
 // Cook up a unique-ish UNIX-domain socket name

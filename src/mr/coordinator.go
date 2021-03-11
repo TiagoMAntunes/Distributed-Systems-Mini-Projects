@@ -17,17 +17,21 @@ type Coordinator struct {
 	lock         *sync.Mutex
 	jobs         JobList
 	reduceNumber int
+	stopLock     sync.Mutex
+	stop         bool
 }
 
 type JobList struct {
-	mapJobs    chan Job
-	reduceJobs chan Job
-	statusLock *sync.RWMutex
-	doReduce   bool
-	mapLock    *sync.RWMutex
-	inProgress map[string]assignedJob // job name -> job
-	countLock  *sync.Mutex
-	mapCount   int
+	mapJobs         chan Job
+	reduceJobs      chan Job
+	statusLock      *sync.RWMutex
+	doReduce        bool
+	mapLock         *sync.RWMutex
+	inProgress      map[string]assignedJob // job name -> job
+	countLock       *sync.Mutex
+	mapCount        int
+	reduceCountLock *sync.RWMutex
+	reduceCount     int
 }
 
 type assignedJob struct {
@@ -69,9 +73,10 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 //
 func (c *Coordinator) Done() bool {
-	ret := false
 
-	// Your code here.
+	c.stopLock.Lock()
+	ret := c.stop
+	c.stopLock.Unlock()
 
 	return ret
 }
@@ -88,7 +93,7 @@ func (c *Coordinator) Register(req *RegisterRequest, rep *RegisterReply) error {
 }
 
 func (c *Coordinator) GetWork(req *WorkRequest, rep *WorkReply) error {
-	fmt.Println("Assign work to ", req.ID)
+	//fmt.Println("Assign work to ", req.ID)
 	c.jobs.statusLock.RLock()
 	status := c.jobs.doReduce
 	c.jobs.statusLock.RUnlock()
@@ -107,7 +112,7 @@ func (c *Coordinator) GetWork(req *WorkRequest, rep *WorkReply) error {
 	case task = <-ch:
 		wait = false
 	default:
-		fmt.Println("No job found")
+		//fmt.Println("No job found")
 		wait = true
 	}
 
@@ -157,21 +162,36 @@ func (c *Coordinator) SubmitWork(req *WorkSubmitRequest, rep *WorkSubmitReply) e
 		c.jobs.mapLock.Unlock()
 	}
 
-	// update status to initiate reduce jobs
-	go func() {
-		c.jobs.countLock.Lock()
-		defer c.jobs.countLock.Unlock()
+	c.jobs.statusLock.RLock()
+	reduceStatus := c.jobs.doReduce
+	c.jobs.statusLock.RUnlock()
 
+	if !reduceStatus {
+		// update status to initiate reduce jobs
+		c.jobs.countLock.Lock()
 		c.jobs.mapCount--
+
 		if c.jobs.mapCount == 0 {
 			// can start doing reduce functions
 			c.jobs.statusLock.Lock()
-			// c.jobs.doReduce = true FIXME
-			// here maybe we should update all the reduce jobs for them to have the required filenames or just some meta data to get them
+			c.jobs.doReduce = true
 			c.jobs.statusLock.Unlock()
 		}
 
-	}()
+		c.jobs.countLock.Unlock()
+
+	} else {
+		c.jobs.reduceCountLock.Lock()
+		c.jobs.reduceCount--
+
+		if c.jobs.reduceCount == 0 {
+			c.stopLock.Lock()
+			c.stop = true
+			c.stopLock.Unlock()
+		}
+		c.jobs.reduceCountLock.Unlock()
+
+	}
 
 	return nil
 }
@@ -182,7 +202,7 @@ func (c *Coordinator) SubmitWork(req *WorkSubmitRequest, rep *WorkSubmitReply) e
 // nReduce is the number of reduce tasks to use.
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{reduceNumber: nReduce}
+	c := Coordinator{reduceNumber: nReduce, stop: false}
 
 	c.lock = new(sync.Mutex)
 	c.nextWorker = 0
@@ -195,10 +215,10 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	}
 
 	for i := 0; i < nReduce; i++ {
-		reduces <- Job{JobType: REDUCE, Filename: "", ID: i} // FIXME
+		reduces <- Job{JobType: REDUCE, Filename: fmt.Sprintf("reduce-%v", i), ID: i, MapCount: len(files)}
 	}
 
-	jobs := JobList{mapJobs: maps, reduceJobs: reduces, statusLock: new(sync.RWMutex), inProgress: make(map[string]assignedJob), mapLock: new(sync.RWMutex), mapCount: len(files), countLock: new(sync.Mutex)}
+	jobs := JobList{mapJobs: maps, reduceJobs: reduces, statusLock: new(sync.RWMutex), inProgress: make(map[string]assignedJob), mapLock: new(sync.RWMutex), mapCount: len(files), countLock: new(sync.Mutex), reduceCountLock: new(sync.RWMutex), reduceCount: nReduce}
 	c.jobs = jobs
 
 	c.server()
