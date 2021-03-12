@@ -26,17 +26,16 @@ type JobList struct {
 	reduceJobs      chan Job
 	statusLock      *sync.RWMutex
 	doReduce        bool
-	mapLock         *sync.RWMutex
+	mapLock         *sync.Mutex
 	inProgress      map[string]assignedJob // job name -> job
 	countLock       *sync.Mutex
 	mapCount        int
-	reduceCountLock *sync.RWMutex
+	reduceCountLock *sync.Mutex
 	reduceCount     int
 }
 
 type assignedJob struct {
 	task     Job
-	worker   int
 	finished bool
 }
 
@@ -124,25 +123,25 @@ func (c *Coordinator) GetWork(req *WorkRequest, rep *WorkReply) error {
 		return nil
 	}
 
-	saveJob := assignedJob{task: task, worker: req.ID}
+	saveJob := assignedJob{task: task}
 
 	// save info
 	c.jobs.mapLock.Lock()
-	c.jobs.inProgress[task.Filename] = saveJob
+	_, ok := c.jobs.inProgress[task.Filename]
+	if !ok {
+		c.jobs.inProgress[task.Filename] = saveJob
+	}
 	c.jobs.mapLock.Unlock()
 
 	// avoid stalls
 	go func() {
 		time.Sleep(time.Second * 10) // as said in the hints section
-		c.jobs.mapLock.RLock()
+		c.jobs.mapLock.Lock()
 		job, ok := c.jobs.inProgress[task.Filename]
-		c.jobs.mapLock.RUnlock()
+		c.jobs.mapLock.Unlock()
 
 		if ok && !job.finished {
 			// restart the job
-			c.jobs.mapLock.Lock()
-			delete(c.jobs.inProgress, task.Filename)
-			c.jobs.mapLock.Unlock()
 			ch <- job.task // put it back in the list to be done
 		}
 	}()
@@ -150,20 +149,18 @@ func (c *Coordinator) GetWork(req *WorkRequest, rep *WorkReply) error {
 }
 
 func (c *Coordinator) SubmitWork(req *WorkSubmitRequest, rep *WorkSubmitReply) error {
-	c.jobs.mapLock.RLock()
+	c.jobs.mapLock.Lock()
 	job := c.jobs.inProgress[req.Filename]
-	c.jobs.mapLock.RUnlock()
-
 	if !job.finished {
 		// job not finished before
 		job.finished = true
-		c.jobs.mapLock.Lock()
 		c.jobs.inProgress[req.Filename] = job // update status
-		c.jobs.mapLock.Unlock()
 	} else {
 		// this worker was late
+		c.jobs.mapLock.Unlock()
 		return nil
 	}
+	c.jobs.mapLock.Unlock()
 
 	c.jobs.statusLock.RLock()
 	reduceStatus := c.jobs.doReduce
@@ -221,7 +218,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		reduces <- Job{JobType: REDUCE, Filename: fmt.Sprintf("mr-out-%v", i), ID: i, MapCount: len(files)}
 	}
 
-	jobs := JobList{mapJobs: maps, reduceJobs: reduces, statusLock: new(sync.RWMutex), inProgress: make(map[string]assignedJob), mapLock: new(sync.RWMutex), mapCount: len(files), countLock: new(sync.Mutex), reduceCountLock: new(sync.RWMutex), reduceCount: nReduce}
+	jobs := JobList{mapJobs: maps, reduceJobs: reduces, statusLock: new(sync.RWMutex), inProgress: make(map[string]assignedJob), mapLock: new(sync.Mutex), mapCount: len(files), countLock: new(sync.Mutex), reduceCountLock: new(sync.Mutex), reduceCount: nReduce}
 	c.jobs = jobs
 
 	c.server()
