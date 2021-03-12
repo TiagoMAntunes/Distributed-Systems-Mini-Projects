@@ -160,6 +160,9 @@ func (c *Coordinator) SubmitWork(req *WorkSubmitRequest, rep *WorkSubmitReply) e
 		c.jobs.mapLock.Lock()
 		c.jobs.inProgress[req.Filename] = job // update status
 		c.jobs.mapLock.Unlock()
+	} else {
+		// this worker was late
+		return nil
 	}
 
 	c.jobs.statusLock.RLock()
@@ -215,7 +218,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	}
 
 	for i := 0; i < nReduce; i++ {
-		reduces <- Job{JobType: REDUCE, Filename: fmt.Sprintf("reduce-%v", i), ID: i, MapCount: len(files)}
+		reduces <- Job{JobType: REDUCE, Filename: fmt.Sprintf("mr-out-%v", i), ID: i, MapCount: len(files)}
 	}
 
 	jobs := JobList{mapJobs: maps, reduceJobs: reduces, statusLock: new(sync.RWMutex), inProgress: make(map[string]assignedJob), mapLock: new(sync.RWMutex), mapCount: len(files), countLock: new(sync.Mutex), reduceCountLock: new(sync.RWMutex), reduceCount: nReduce}

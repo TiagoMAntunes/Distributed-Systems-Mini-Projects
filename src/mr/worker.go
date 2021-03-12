@@ -83,7 +83,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
 		} else {
 			//fmt.Println("Waiting...")
-			time.Sleep(time.Second * 3)
+			time.Sleep(time.Second * 1)
 		}
 
 	}
@@ -93,11 +93,12 @@ func doReduce(task Job, reducef func(string, []string) string) {
 	files := make([]*os.File, task.MapCount)
 	decoders := make([]*json.Decoder, task.MapCount)
 
-	// open all map intermediate files
+	// open all reduce intermediate files
 	for i := 0; i < task.MapCount; i++ {
-		file, ok := os.Open(fmt.Sprintf("mr-%v-%v", i, task.ID))
+		name := fmt.Sprintf("mr-%v-%v", i, task.ID)
+		file, ok := os.Open(name)
 		if ok != nil {
-			log.Fatalf("cannot open %v", task.Filename)
+			log.Fatalf("cannot open %v", name)
 		}
 
 		files[i] = file
@@ -122,7 +123,8 @@ func doReduce(task Job, reducef func(string, []string) string) {
 	sort.Sort(ByKey(kva))
 
 	oname := fmt.Sprintf("mr-out-%v", task.ID)
-	ofile, ok := os.Create(oname)
+	// ofile, ok := os.Create(oname)
+	ofile, ok := ioutil.TempFile(".", task.Filename+"*")
 	if ok != nil {
 		log.Fatalf("cannot open %v", oname)
 	}
@@ -150,6 +152,7 @@ func doReduce(task Job, reducef func(string, []string) string) {
 	}
 
 	ofile.Close()
+	os.Rename(ofile.Name(), task.Filename)
 
 }
 
