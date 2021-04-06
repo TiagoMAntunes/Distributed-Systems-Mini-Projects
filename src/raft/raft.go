@@ -71,18 +71,15 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	currentTerm  int
-	votedFor     int // points to the currentTerm leader of this node. -1 is None
+	votedFor     int
 	gotContacted bool
 	voteCount    int
+	leader       int
 }
 
 // This function is unsafe on purpose
 func (rf *Raft) isLeader() bool {
-	if rf.votedFor == SELF_LEADER {
-		return true
-	} else {
-		return false
-	}
+	return rf.leader == rf.me
 }
 
 // return currentTerm and whether this server
@@ -180,8 +177,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		reply.Term = rf.currentTerm
 	} else {
-		rf.votedFor = args.LeaderId
+		rf.votedFor = -1
 		rf.currentTerm = args.Term
+		rf.leader = args.LeaderId
 		rf.gotContacted = true
 		reply.Success = true
 
@@ -335,7 +333,8 @@ func (rf *Raft) leaderNotify(i, term, leaderId int) {
 		// if hasn't received a vote call yet
 		if rf.currentTerm < reply.Term {
 			fmt.Printf("[%v] %v was behind in terms. Updating from term %v to term %v\n", makeTimestamp(), rf.me, term, reply.Term)
-			rf.votedFor = rf.me // random status
+			rf.votedFor = -1 // random status
+			rf.leader = -1   // no longer the leader
 		}
 	}
 }
@@ -354,12 +353,14 @@ func (rf *Raft) candidateNotify(i, term, candidateId int) {
 	if !reply.VoteGranted && rf.currentTerm < reply.Term {
 		// Candidate is late. become follower again
 		fmt.Printf("[%v] Candidate %v is late and will now become a follower again\n", makeTimestamp(), rf.me)
-		rf.votedFor = rf.me // default case because we don't know who's the leader yet
+		rf.votedFor = -1 // default case because we don't know who's the leader yet
+		rf.leader = -1
 	} else if reply.VoteGranted && rf.votedFor != SELF_LEADER {
 		rf.voteCount += 1
 		if rf.voteCount > len(rf.peers)/2 {
 			// majority, can become leader
-			rf.votedFor = SELF_LEADER
+			rf.votedFor = -1
+			rf.leader = rf.me
 			fmt.Printf("[%v] THE NEW LEADER IS %v !!!!!!!!!!!!!!!!!!!!\n", makeTimestamp(), rf.me)
 			rf.broadcast()
 		}
@@ -440,8 +441,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
-	rf.votedFor = me // initially is a follower but we don't know the leader yet
+	rf.votedFor = -1
 	rf.gotContacted = false
+	rf.leader = -1
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
