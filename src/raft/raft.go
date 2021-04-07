@@ -53,9 +53,14 @@ type ApplyMsg struct {
 }
 
 const (
-	SELF_LEADER = -1
-	CANDIDATE   = -2
+	LEADER_UNKNOWN = -1
+	CANDIDATE      = -2
 )
+
+type JobEntry struct {
+	Job  interface{}
+	Term int
+}
 
 //
 // A Go object implementing a single Raft peer.
@@ -66,6 +71,7 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	applyCh   chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -75,6 +81,13 @@ type Raft struct {
 	gotContacted bool
 	voteCount    int
 	leader       int
+
+	// logs
+	log         []JobEntry
+	commitIndex int
+	lastApplied int
+	nextIndex   []int
+	matchIndex  []int
 }
 
 // This function is unsafe on purpose
@@ -160,7 +173,10 @@ type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
 
-	//TODO logs
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []JobEntry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -172,20 +188,46 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if args.Term < rf.currentTerm {
+	// Figure 2 conditions 1. and 2.
+	if args.Term < rf.currentTerm || args.PrevLogIndex != -1 && (rf.lastApplied < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
+		if args.Term < rf.currentTerm {
+			rf.gotContacted = true
+		}
 		fmt.Printf("[%v] Follower %v refusing append entries from %v. Term is %v and received term %v\n", makeTimestamp(), rf.me, args.LeaderId, rf.currentTerm, args.Term)
 		reply.Success = false
 		reply.Term = rf.currentTerm
-	} else {
-		rf.votedFor = -1
-		rf.currentTerm = args.Term
-		rf.leader = args.LeaderId
-		rf.gotContacted = true
-		reply.Success = true
-
-		// TODO logs
-
+		return
 	}
+
+	// has content to add
+	if args.PrevLogIndex != -1 {
+		fmt.Printf("[%v] Server %v adding new command...\n", makeTimestamp(), rf.me)
+		// remove all following entries and just put in the new ones
+		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+		rf.lastApplied = len(rf.log)
+
+		if args.LeaderCommit > rf.commitIndex {
+			prev := rf.commitIndex + 1
+			rf.commitIndex = args.LeaderCommit
+			if rf.lastApplied < args.LeaderCommit {
+				rf.commitIndex = rf.lastApplied
+
+			}
+			for ; prev <= rf.commitIndex; prev++ {
+				fmt.Printf("[DEBUG] Server %v sending information about %v\n", rf.me, prev)
+				msg := ApplyMsg{CommandValid: true, Command: rf.log[prev].Job, CommandIndex: prev}
+				rf.applyCh <- msg
+			}
+			fmt.Printf("[DEBUG] Server %v commit index is %v\n", rf.me, rf.commitIndex)
+		}
+	}
+
+	rf.votedFor = -1
+	rf.currentTerm = args.Term
+	rf.leader = args.LeaderId
+	rf.gotContacted = true
+	reply.Success = true
+	reply.Term = args.Term
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -202,7 +244,8 @@ type RequestVoteArgs struct {
 	Term        int
 	CandidateId int
 
-	// TODO logs info
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -226,7 +269,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
-	} else if (args.Term > rf.currentTerm) && (true /*FIXME log*/) {
+	} else if (rf.votedFor == -1 || rf.votedFor == CANDIDATE) && (rf.log[rf.lastApplied].Term < args.LastLogTerm || rf.log[rf.lastApplied].Term == args.LastLogTerm && args.LastLogIndex >= rf.lastApplied) {
 		reply.VoteGranted = true
 		rf.currentTerm = args.Term
 	}
@@ -288,12 +331,23 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	// Your code here (2B).
+	isLeader := rf.isLeader()
+	if !isLeader {
+		fmt.Printf("[%v] Server %v rejecting new command.\n", makeTimestamp(), rf.me)
+		return -1, -1, false
+	}
 
+	fmt.Printf("[%v] Server %v Adding new command at term %v, match index is %v\n", makeTimestamp(), rf.me, rf.currentTerm, rf.matchIndex[rf.me])
+
+	rf.lastApplied++
+	index := rf.lastApplied
+	term := rf.currentTerm
+
+	rf.log = append(rf.log, JobEntry{Job: command, Term: term})
+	rf.matchIndex[rf.me]++
 	return index, term, isLeader
 }
 
@@ -318,34 +372,53 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) leaderNotify(i, term, leaderId int) {
-	args := AppendEntriesArgs{Term: term, LeaderId: leaderId}
+func (rf *Raft) leaderNotify(i, term, leaderId, prevLogIndex, prevLogTerm int, entries []JobEntry, leaderCommit int) {
+	args := AppendEntriesArgs{Term: term, LeaderId: leaderId, PrevLogIndex: prevLogIndex, PrevLogTerm: prevLogTerm, Entries: entries, LeaderCommit: leaderCommit}
 	reply := AppendEntriesReply{}
-	fmt.Printf("[%v] Leader %v contacting follower %v in term %v\n", makeTimestamp(), leaderId, i, term)
-	rf.sendAppendEntries(i, &args, &reply)
+	fmt.Printf("[%v] Leader %v contacting follower %v in term %v, sending size is %v, prevLogIndex is %v\n", makeTimestamp(), leaderId, i, term, len(entries), prevLogIndex)
+	ok := rf.sendAppendEntries(i, &args, &reply)
+	if !ok {
+		fmt.Printf("[%v] Leader %v did not hear from %v\n", makeTimestamp(), rf.me, i)
+		return
+	}
 	fmt.Printf("[%v] Leader %v received message from follower %v in term %v with result %v\n", makeTimestamp(), leaderId, i, term, reply.Success)
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if !reply.Success {
-		// probably an election happened
-
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-		// if hasn't received a vote call yet
+		// if it is no longer the leader
 		if rf.currentTerm < reply.Term {
 			fmt.Printf("[%v] %v was behind in terms. Updating from term %v to term %v\n", makeTimestamp(), rf.me, term, reply.Term)
-			rf.votedFor = -1 // random status
-			rf.leader = -1   // no longer the leader
+			rf.votedFor = -1           // random status
+			rf.leader = LEADER_UNKNOWN // no longer the leader
+			rf.currentTerm = reply.Term
+			// fmt.Printf("[%v] Server %v Finished updating itself to have a new term %v\n", makeTimestamp(), rf.me, rf.currentTerm)
+		} else if reply.Term != 0 { // this avoids the case where the connection failed
+			// just need to lower the next index to send
+			fmt.Printf("[DEBUG] Server %v lowering next index to %v, new value %v\n", rf.me, i, rf.nextIndex[i]-1)
+			rf.nextIndex[i]--
 		}
+	} else if len(entries) > 0 {
+
+		// need to update follower information
+		fmt.Printf("[DEBUG] Server %v to index %v matchIndex was %v, logsize is %v\n", rf.me, i, rf.matchIndex[i], len(rf.log))
+		rf.matchIndex[i] = prevLogIndex + len(entries)
+		rf.nextIndex[i] = rf.matchIndex[i] + 1
+		fmt.Printf("[DEBUG] Server %v new matchIndex to %v is %v\n", rf.me, i, rf.matchIndex[i])
 	}
 }
 
-func (rf *Raft) candidateNotify(i, term, candidateId int) {
-	args := RequestVoteArgs{Term: term, CandidateId: candidateId}
+func (rf *Raft) candidateNotify(i, term, candidateId, lastLogIndex, lastLogTerm int) {
+	args := RequestVoteArgs{Term: term, CandidateId: candidateId, LastLogIndex: lastLogIndex, LastLogTerm: lastLogTerm}
 	reply := RequestVoteReply{}
 
 	fmt.Printf("[%v] Candidate %v requesting vote to %v in term %v\n", makeTimestamp(), candidateId, i, term)
-	rf.sendRequestVote(i, &args, &reply)
-	fmt.Printf("[%v] Candidate %v received vote result from follower %v in term %v\n", makeTimestamp(), candidateId, i, term)
+	ok := rf.sendRequestVote(i, &args, &reply)
+	if !ok {
+		fmt.Printf("[%v] Server %v did not receive vote in time from %v\n", makeTimestamp(), rf.me, i)
+		return
+	}
+	fmt.Printf("[%v] Candidate %v received vote result from follower %v in term %v with result %v\n", makeTimestamp(), candidateId, i, term, reply.VoteGranted)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -354,13 +427,24 @@ func (rf *Raft) candidateNotify(i, term, candidateId int) {
 		// Candidate is late. become follower again
 		fmt.Printf("[%v] Candidate %v is late and will now become a follower again\n", makeTimestamp(), rf.me)
 		rf.votedFor = -1 // default case because we don't know who's the leader yet
-		rf.leader = -1
-	} else if reply.VoteGranted && rf.votedFor != SELF_LEADER {
+		rf.leader = LEADER_UNKNOWN
+		rf.currentTerm = reply.Term
+		rf.gotContacted = true // reset timer
+
+	} else if reply.VoteGranted && rf.votedFor != -1 {
 		rf.voteCount += 1
 		if rf.voteCount > len(rf.peers)/2 {
 			// majority, can become leader
 			rf.votedFor = -1
+			rf.voteCount = -1
 			rf.leader = rf.me
+
+			for i := range rf.matchIndex {
+				rf.matchIndex[i] = 0
+				rf.nextIndex[i] = rf.lastApplied + 1
+				fmt.Printf("[DEBUG] Server %v next index to %v is %v\n", rf.me, i, rf.nextIndex[i])
+			}
+
 			fmt.Printf("[%v] THE NEW LEADER IS %v !!!!!!!!!!!!!!!!!!!!\n", makeTimestamp(), rf.me)
 			rf.broadcast()
 		}
@@ -369,9 +453,53 @@ func (rf *Raft) candidateNotify(i, term, candidateId int) {
 
 func (rf *Raft) broadcast() {
 	// send heartbeat to all followers
+	var nilSlice []JobEntry // nil slice for heartbeat
+
 	for i := range rf.peers {
 		if i != rf.me {
-			go rf.leaderNotify(i, rf.currentTerm, rf.me)
+			var sendingSlice []JobEntry
+			var prevLogIndex int
+			var prevLogTerm int
+			fmt.Printf("[DEBUG] Server %v, %v vs %v\n", rf.me, rf.nextIndex[i], rf.lastApplied)
+			if rf.nextIndex[i] > rf.lastApplied {
+				// empty heartbeat
+				sendingSlice = nilSlice
+				prevLogIndex = -1
+				prevLogTerm = 0
+			} else {
+				prevLogIndex = rf.nextIndex[i] - 1
+				prevLogTerm = rf.log[prevLogIndex].Term
+				sendingSlice = rf.log[prevLogIndex+1:]
+			}
+			go rf.leaderNotify(i, rf.currentTerm, rf.me, prevLogIndex, prevLogTerm, sendingSlice, rf.commitIndex)
+		}
+	}
+}
+
+func (rf *Raft) checkCommit() {
+	// check if any message can be considered committed
+
+	count := make([]int, len(rf.log)+1)
+
+	for i, v := range rf.matchIndex {
+		fmt.Printf("[DEBUG] MatchIndex index %v has value %v\n", i, v)
+		count[v]++
+	}
+
+	// a value ahead means that it is counted before so we can do a reverse sum here
+	fmt.Printf("[DEBUG] Index %v count is %v\n", len(rf.log)-1, count[len(rf.log)-1])
+	for i := len(rf.log) - 2; i >= 0; i-- {
+		count[i] += count[i+1]
+		fmt.Printf("[DEBUG] Index %v count is %v\n", i, count[i])
+	}
+
+	for i, v := range count {
+		if i > rf.commitIndex && v > len(rf.peers)/2 && rf.log[i].Term == rf.currentTerm {
+			rf.commitIndex = rf.commitIndex + i
+			fmt.Printf("[DEBUG] Server %v sending information about %v\n", rf.me, i)
+			msg := ApplyMsg{CommandValid: true, Command: rf.log[i].Job, CommandIndex: i}
+			rf.applyCh <- msg
+			fmt.Printf("[DEBUG] New commit index %v\n", i)
 		}
 	}
 }
@@ -382,7 +510,7 @@ func (rf *Raft) ticker() {
 
 	time.Sleep(time.Duration(1000000 * rand.Intn(400)))
 
-	for rf.killed() == false {
+	for !rf.killed() {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
@@ -392,6 +520,7 @@ func (rf *Raft) ticker() {
 		var sleepTime time.Duration
 		isLeader := rf.isLeader()
 		if isLeader {
+			rf.checkCommit()
 			rf.broadcast()                     // heartbeat all followers
 			sleepTime = time.Millisecond * 100 // fixed time, 10 times per second max
 		} else {
@@ -399,12 +528,13 @@ func (rf *Raft) ticker() {
 				// start election
 				rf.currentTerm += 1
 				rf.votedFor = CANDIDATE
+				rf.voteCount = 1 // vote for itself
 
 				fmt.Printf("[%v] Follower %v failed to be contacted, initiating election in term %v\n", makeTimestamp(), rf.me, rf.currentTerm)
 				// request vote from all others
 				for i := range rf.peers {
 					if i != rf.me {
-						go rf.candidateNotify(i, rf.currentTerm, rf.me)
+						go rf.candidateNotify(i, rf.currentTerm, rf.me, rf.lastApplied, rf.log[rf.lastApplied].Term)
 					}
 				}
 				sleepTime = time.Duration(1000000 * (100 + rand.Intn(200))) // 100-300ms
@@ -438,12 +568,26 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	rf.voteCount = -1
 	rf.gotContacted = false
-	rf.leader = -1
+	rf.leader = LEADER_UNKNOWN
+
+	rf.log = make([]JobEntry, 1)
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
+
+	// FIXME
+	// for i := 0; i < len(peers); i++ {
+	// 	rf.nextIndex[i] = 0
+	// 	rf.matchIndex[i] = 0
+	// }
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
