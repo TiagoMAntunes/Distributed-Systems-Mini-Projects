@@ -180,8 +180,9 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term      int
+	Success   bool
+	LastIndex int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -189,37 +190,40 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 
 	// Figure 2 conditions 1. and 2.
-	if args.Term < rf.currentTerm || args.PrevLogIndex != -1 && (rf.lastApplied < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
+	if args.Term < rf.currentTerm || rf.lastApplied < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		if args.Term < rf.currentTerm {
 			rf.gotContacted = true
 		}
 		fmt.Printf("[%v] Follower %v refusing append entries from %v. Term is %v and received term %v\n", makeTimestamp(), rf.me, args.LeaderId, rf.currentTerm, args.Term)
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		reply.LastIndex = rf.lastApplied
 		return
 	}
 
 	// has content to add
-	if args.PrevLogIndex != -1 {
-		fmt.Printf("[%v] Server %v adding new command...\n", makeTimestamp(), rf.me)
+	if len(args.Entries) > 0 {
+		fmt.Printf("[%v] Server %v adding new command...Log size was %v\n", makeTimestamp(), rf.me, len(rf.log))
 		// remove all following entries and just put in the new ones
 		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
-		rf.lastApplied = len(rf.log)
+		rf.lastApplied = len(rf.log) - 1
+	}
 
-		if args.LeaderCommit > rf.commitIndex {
-			prev := rf.commitIndex + 1
-			rf.commitIndex = args.LeaderCommit
-			if rf.lastApplied < args.LeaderCommit {
-				rf.commitIndex = rf.lastApplied
+	// get commit information
+	if args.LeaderCommit > rf.commitIndex {
+		fmt.Printf("[DEBUG] Server %v leaderCommit=%v, commitIndex=%v\n", rf.me, args.LeaderCommit, rf.commitIndex)
+		prev := rf.commitIndex + 1
+		rf.commitIndex = args.LeaderCommit
+		if rf.lastApplied < args.LeaderCommit {
+			rf.commitIndex = rf.lastApplied
 
-			}
-			for ; prev <= rf.commitIndex; prev++ {
-				fmt.Printf("[DEBUG] Server %v sending information about %v\n", rf.me, prev)
-				msg := ApplyMsg{CommandValid: true, Command: rf.log[prev].Job, CommandIndex: prev}
-				rf.applyCh <- msg
-			}
-			fmt.Printf("[DEBUG] Server %v commit index is %v\n", rf.me, rf.commitIndex)
 		}
+		for ; prev <= rf.commitIndex; prev++ {
+			fmt.Printf("[DEBUG] Server %v sending information about %v, log size is %v\n", rf.me, prev, len(rf.log))
+			msg := ApplyMsg{CommandValid: true, Command: rf.log[prev].Job, CommandIndex: prev}
+			rf.applyCh <- msg
+		}
+		fmt.Printf("[DEBUG] Server %v commit index is %v\n", rf.me, rf.commitIndex)
 	}
 
 	rf.votedFor = -1
@@ -340,7 +344,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false
 	}
 
-	fmt.Printf("[%v] Server %v Adding new command at term %v, match index is %v\n", makeTimestamp(), rf.me, rf.currentTerm, rf.matchIndex[rf.me])
+	fmt.Printf("[%v] Server %v Adding new command at term %v, match index is %v, content=%v\n", makeTimestamp(), rf.me, rf.currentTerm, rf.matchIndex[rf.me], command)
 
 	rf.lastApplied++
 	index := rf.lastApplied
@@ -395,11 +399,10 @@ func (rf *Raft) leaderNotify(i, term, leaderId, prevLogIndex, prevLogTerm int, e
 			// fmt.Printf("[%v] Server %v Finished updating itself to have a new term %v\n", makeTimestamp(), rf.me, rf.currentTerm)
 		} else if reply.Term != 0 { // this avoids the case where the connection failed
 			// just need to lower the next index to send
-			fmt.Printf("[DEBUG] Server %v lowering next index to %v, new value %v\n", rf.me, i, rf.nextIndex[i]-1)
-			rf.nextIndex[i]--
+			fmt.Printf("[DEBUG] Server %v lowering next index to %v, new value %v\n", rf.me, i, reply.LastIndex)
+			rf.nextIndex[i] = reply.LastIndex
 		}
-	} else if len(entries) > 0 {
-
+	} else {
 		// need to update follower information
 		fmt.Printf("[DEBUG] Server %v to index %v matchIndex was %v, logsize is %v\n", rf.me, i, rf.matchIndex[i], len(rf.log))
 		rf.matchIndex[i] = prevLogIndex + len(entries)
@@ -445,6 +448,8 @@ func (rf *Raft) candidateNotify(i, term, candidateId, lastLogIndex, lastLogTerm 
 				fmt.Printf("[DEBUG] Server %v next index to %v is %v\n", rf.me, i, rf.nextIndex[i])
 			}
 
+			rf.matchIndex[rf.me] = rf.lastApplied // self is updated
+
 			fmt.Printf("[%v] THE NEW LEADER IS %v !!!!!!!!!!!!!!!!!!!!\n", makeTimestamp(), rf.me)
 			rf.broadcast()
 		}
@@ -458,17 +463,13 @@ func (rf *Raft) broadcast() {
 	for i := range rf.peers {
 		if i != rf.me {
 			var sendingSlice []JobEntry
-			var prevLogIndex int
-			var prevLogTerm int
+			prevLogIndex := rf.nextIndex[i] - 1
+			prevLogTerm := rf.log[prevLogIndex].Term
 			fmt.Printf("[DEBUG] Server %v, %v vs %v\n", rf.me, rf.nextIndex[i], rf.lastApplied)
 			if rf.nextIndex[i] > rf.lastApplied {
 				// empty heartbeat
 				sendingSlice = nilSlice
-				prevLogIndex = -1
-				prevLogTerm = 0
 			} else {
-				prevLogIndex = rf.nextIndex[i] - 1
-				prevLogTerm = rf.log[prevLogIndex].Term
 				sendingSlice = rf.log[prevLogIndex+1:]
 			}
 			go rf.leaderNotify(i, rf.currentTerm, rf.me, prevLogIndex, prevLogTerm, sendingSlice, rf.commitIndex)
@@ -487,16 +488,16 @@ func (rf *Raft) checkCommit() {
 	}
 
 	// a value ahead means that it is counted before so we can do a reverse sum here
-	fmt.Printf("[DEBUG] Index %v count is %v\n", len(rf.log)-1, count[len(rf.log)-1])
+	fmt.Printf("[DEBUG] Index %v count is %v, content=%v\n", len(rf.log)-1, count[len(rf.log)-1], rf.log[len(rf.log)-1].Job)
 	for i := len(rf.log) - 2; i >= 0; i-- {
 		count[i] += count[i+1]
-		fmt.Printf("[DEBUG] Index %v count is %v\n", i, count[i])
+		fmt.Printf("[DEBUG] Index %v count is %v, content=%v\n", i, count[i], rf.log[i].Job)
 	}
 
 	for i, v := range count {
 		if i > rf.commitIndex && v > len(rf.peers)/2 && rf.log[i].Term == rf.currentTerm {
-			rf.commitIndex = rf.commitIndex + i
-			fmt.Printf("[DEBUG] Server %v sending information about %v\n", rf.me, i)
+			rf.commitIndex = i // new commit index, increases monotically
+			fmt.Printf("[DEBUG] Server %v sending information about %v, content=%v\n", rf.me, i, rf.log[i].Job)
 			msg := ApplyMsg{CommandValid: true, Command: rf.log[i].Job, CommandIndex: i}
 			rf.applyCh <- msg
 			fmt.Printf("[DEBUG] New commit index %v\n", i)
