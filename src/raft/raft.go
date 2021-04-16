@@ -30,6 +30,8 @@ import (
 	"6.824/labrpc"
 )
 
+var DEBUG = true
+
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -181,9 +183,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term      int
-	Success   bool
-	LastIndex int
+	Term         int
+	Success      bool
+	ConflictTerm int
+	TermStart    int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -202,6 +205,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 	return
 	// }
 
+	// Checkup
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.leader = args.LeaderId
+	}
+
 	reply.Success = false
 	reply.Term = rf.currentTerm
 
@@ -211,7 +220,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else if rf.lastApplied < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		termIndex := 0
 
-		for i, v := range rf.log {
+		// for i, v := range rf.log {
+		for i := len(rf.log) - 1; i > 0; i-- {
+			v := rf.log[i]
 			if v.Term == args.PrevLogTerm {
 				termIndex = i
 				break
@@ -222,16 +233,32 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 		rf.debug("Rejecting append entries. Reason: Incompatible log. Term starts at %v", termIndex)
-		reply.LastIndex = termIndex
+		reply.TermStart = termIndex
+		reply.ConflictTerm = rf.log[termIndex].Term
 		return
 	}
 
 	// has content to add
 	if len(args.Entries) > 0 {
 		rf.debug("Server %v adding new command...Log size was %v\n", rf.me, len(rf.log))
+
+		// sanity check
+		j := 0
+		for i := args.PrevLogIndex + 1; i <= rf.commitIndex && j < len(args.Entries); i++ {
+			if rf.log[i].Term != args.Entries[j].Term {
+
+				panic(fmt.Sprintf("Server %v removing committed entry replacing by one from another term, i=%v, j=%v. Received prevLogIndex=%v\n Incoming values = %v\n Log value is %v\nDiffering values are %v and %v\n", rf.me, i, j, args.PrevLogIndex, args.Entries, rf.log[:i+1], rf.log[i].Job, args.Entries[j].Job))
+			}
+			j++
+		}
+
 		// remove all following entries and just put in the new ones
 		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 		rf.lastApplied = len(rf.log) - 1
+
+		// if args.PrevLogIndex < rf.commitIndex {
+		// 	rf.debug("Server %v is removing commited entries! PrevLogIndex=%v commitIndex=%v\n", rf.me, args.PrevLogIndex, rf.commitIndex)
+		// }
 	}
 
 	// get commit information
@@ -257,6 +284,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.gotContacted = true
 	reply.Success = true
 	reply.Term = args.Term
+
+	// just to relax
+	lastTerm := 0
+	for i, v := range rf.log {
+		if v.Term < lastTerm {
+			panic(fmt.Sprintf("Server %v has incorrect term order at index %v. Previous term entry term was %v, new one is %v\n", rf.me, i, lastTerm, v.Term))
+		}
+		lastTerm = v.Term
+	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -310,13 +346,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 	rf.leader = LEADER_UNKNOWN
 	// }
 
+	if rf.currentTerm < args.Term {
+		rf.currentTerm = args.Term
+		rf.leader = LEADER_UNKNOWN
+	}
+
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 		rf.debug("Rejecting vote to %v. Reason: candidate is late in terms.\n", args.CandidateId)
 	} else if (rf.votedFor == -1 || rf.votedFor == CANDIDATE) && (rf.log[rf.lastApplied].Term < args.LastLogTerm || rf.log[rf.lastApplied].Term == args.LastLogTerm && args.LastLogIndex >= rf.lastApplied) {
 		reply.VoteGranted = true
-		rf.currentTerm = args.Term
+		// rf.currentTerm = args.Term
 		rf.gotContacted = true
 		rf.debug("Granting vote to %v.\n", args.CandidateId)
 	} else {
@@ -328,10 +369,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	}
 
-	if rf.currentTerm < args.Term {
-		rf.currentTerm = args.Term
-		rf.leader = LEADER_UNKNOWN
-	}
 }
 
 func makeTimestamp() int64 {
@@ -453,8 +490,14 @@ func (rf *Raft) leaderNotify(i, term, leaderId, prevLogIndex, prevLogTerm int, e
 			// rf.debug("Server %v Finished updating itself to have a new term %v\n", rf.me, rf.currentTerm)
 		} else if reply.Term != 0 { // this avoids the case where the connection failed
 			// just need to lower the next index to send
-			rf.debug("Server %v lowering next index to %v, new value %v\n", rf.me, i, reply.LastIndex+1)
-			rf.nextIndex[i] = reply.LastIndex + 1
+			// rf.nextIndex[i] = reply.LastIndex + 1
+			lastConflictIndex := 1
+			for i := reply.TermStart; i > 0 && rf.log[i].Term >= reply.ConflictTerm; i-- {
+				lastConflictIndex = i
+			}
+
+			rf.debug("Server %v lowering next index to %v, new value %v\n", rf.me, i, lastConflictIndex)
+			rf.nextIndex[i] = lastConflictIndex
 		}
 	} else {
 		// need to update follower information
@@ -522,7 +565,7 @@ func (rf *Raft) broadcast() {
 			var sendingSlice []JobEntry
 			prevLogIndex := rf.nextIndex[i] - 1
 			prevLogTerm := rf.log[prevLogIndex].Term
-			rf.debug("Server %v, %v vs %v\n", rf.me, rf.nextIndex[i], rf.lastApplied)
+			rf.debug("Server %v, %v vs %v\n", i, rf.nextIndex[i], rf.lastApplied)
 			if rf.nextIndex[i] > rf.lastApplied {
 				// empty heartbeat
 				sendingSlice = nilSlice
@@ -539,7 +582,7 @@ func (rf *Raft) broadcast() {
 func (rf *Raft) checkCommit(term int) {
 	// check if any message can be considered committed
 
-	count := make([]int, len(rf.log)+1)
+	count := make([]int, len(rf.log))
 
 	for _, v := range rf.matchIndex {
 		//rf.debug("MatchIndex index %v has value %v\n", i, v)
@@ -649,14 +692,17 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) debug(format string, content ...interface{}) {
-	state := "F"
-	if rf.isLeader() {
-		state = "L"
-	} else if rf.votedFor == CANDIDATE {
-		state = "C"
+	if DEBUG {
+		state := "F"
+		if rf.isLeader() {
+			state = "L"
+		} else if rf.votedFor == CANDIDATE {
+			state = "C"
+		}
+		prefix := fmt.Sprintf("[%d:%s:%02d] ", rf.me, state, rf.currentTerm)
+		log.Printf(prefix+format, content...)
+
 	}
-	prefix := fmt.Sprintf("[%d:%s:%02d] ", rf.me, state, rf.currentTerm)
-	log.Printf(prefix+format, content...)
 }
 
 //
