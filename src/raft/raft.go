@@ -217,7 +217,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		rf.debug("Rejecting append entries. Reason: term is behind current term.")
 		return
-	} else if rf.lastApplied < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	} else if len(rf.log)-1 < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		termIndex := 0
 
 		// for i, v := range rf.log {
@@ -254,7 +254,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		// remove all following entries and just put in the new ones
 		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
-		rf.lastApplied = len(rf.log) - 1
+		// rf.lastApplied = len(rf.log) - 1
 
 		// if args.PrevLogIndex < rf.commitIndex {
 		// 	rf.debug("Server %v is removing commited entries! PrevLogIndex=%v commitIndex=%v\n", rf.me, args.PrevLogIndex, rf.commitIndex)
@@ -266,8 +266,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.debug("Server %v leaderCommit=%v, commitIndex=%v\n", rf.me, args.LeaderCommit, rf.commitIndex)
 		prev := rf.commitIndex + 1
 		rf.commitIndex = args.LeaderCommit
-		if rf.lastApplied < args.LeaderCommit {
-			rf.commitIndex = rf.lastApplied
+		if len(rf.log)-1 < args.LeaderCommit {
+			rf.commitIndex = len(rf.log) - 1
 
 		}
 		for ; prev <= rf.commitIndex; prev++ {
@@ -355,7 +355,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 		rf.debug("Rejecting vote to %v. Reason: candidate is late in terms.\n", args.CandidateId)
-	} else if (rf.votedFor == -1 || rf.votedFor == CANDIDATE) && (rf.log[rf.lastApplied].Term < args.LastLogTerm || rf.log[rf.lastApplied].Term == args.LastLogTerm && args.LastLogIndex >= rf.lastApplied) {
+	} else if (rf.votedFor == -1 || rf.votedFor == CANDIDATE) && (rf.log[len(rf.log)-1].Term < args.LastLogTerm || rf.log[len(rf.log)-1].Term == args.LastLogTerm && args.LastLogIndex >= len(rf.log)-1) {
 		reply.VoteGranted = true
 		// rf.currentTerm = args.Term
 		rf.gotContacted = true
@@ -435,8 +435,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.debug("Server %v Adding new command at term %v, match index is %v, content=%v\n", rf.me, rf.currentTerm, rf.matchIndex[rf.me], command)
 
-	rf.lastApplied++
-	index := rf.lastApplied
+	// rf.lastApplied++
+	index := len(rf.log)
 	term := rf.currentTerm
 
 	rf.log = append(rf.log, JobEntry{Job: command, Term: term})
@@ -544,11 +544,11 @@ func (rf *Raft) candidateNotify(i, term, candidateId, lastLogIndex, lastLogTerm 
 
 			for i := range rf.matchIndex {
 				rf.matchIndex[i] = 0
-				rf.nextIndex[i] = rf.lastApplied + 1
+				rf.nextIndex[i] = len(rf.log)
 				rf.debug("Server %v next index to %v is %v\n", rf.me, i, rf.nextIndex[i])
 			}
 
-			rf.matchIndex[rf.me] = rf.lastApplied // self is updated
+			rf.matchIndex[rf.me] = len(rf.log) - 1 // self is updated
 
 			rf.debug("THE NEW LEADER IS %v !!!!!!!!!!!!!!!!!!!!\n", rf.me)
 			rf.broadcast()
@@ -565,8 +565,8 @@ func (rf *Raft) broadcast() {
 			var sendingSlice []JobEntry
 			prevLogIndex := rf.nextIndex[i] - 1
 			prevLogTerm := rf.log[prevLogIndex].Term
-			rf.debug("Server %v, %v vs %v\n", i, rf.nextIndex[i], rf.lastApplied)
-			if rf.nextIndex[i] > rf.lastApplied {
+			rf.debug("Server %v, %v vs %v\n", i, rf.nextIndex[i], len(rf.log)-1)
+			if rf.nextIndex[i] > len(rf.log)-1 {
 				// empty heartbeat
 				sendingSlice = nilSlice
 			} else {
@@ -674,7 +674,7 @@ func (rf *Raft) ticker() {
 				// request vote from all others
 				for i := range rf.peers {
 					if i != rf.me {
-						go rf.candidateNotify(i, rf.currentTerm, rf.me, rf.lastApplied, rf.log[rf.lastApplied].Term)
+						go rf.candidateNotify(i, rf.currentTerm, rf.me, len(rf.log)-1, rf.log[len(rf.log)-1].Term)
 					}
 				}
 				sleepTime = time.Duration(1000000 * (100 + rand.Intn(200))) // 100-300ms
@@ -733,7 +733,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.log = make([]JobEntry, 1)
 	rf.commitIndex = 0
-	rf.lastApplied = 0
+	// rf.lastApplied = 0
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 
