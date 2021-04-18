@@ -57,9 +57,16 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+// votedFor
 const (
 	LEADER_UNKNOWN = -1
-	CANDIDATE      = -2
+)
+
+// state
+const (
+	LEADER    = iota
+	CANDIDATE = iota
+	FOLLOWER  = iota
 )
 
 type JobEntry struct {
@@ -84,7 +91,8 @@ type Raft struct {
 	currentTerm  int
 	votedFor     int
 	gotContacted bool
-	voteCount    int
+	voteCount    []bool
+	state        int
 	leader       int
 
 	// logs
@@ -97,7 +105,7 @@ type Raft struct {
 
 // This function is unsafe on purpose
 func (rf *Raft) isLeader() bool {
-	return rf.leader == rf.me
+	return rf.state == LEADER
 }
 
 // return currentTerm and whether this server
@@ -232,8 +240,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Checkup
 	if args.Term >= rf.currentTerm {
 		rf.currentTerm = args.Term
-		rf.leader = args.LeaderId
-		rf.votedFor = -1
+		rf.state = FOLLOWER
+		rf.votedFor = LEADER_UNKNOWN
+		rf.state = FOLLOWER
 	}
 
 	reply.Success = false
@@ -303,9 +312,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.debug("Server %v commit index is %v\n", rf.me, rf.commitIndex)
 	}
 
-	rf.votedFor = -1
+	// rf.votedFor = LEADER_UNKNOWN
 	rf.currentTerm = args.Term
-	rf.leader = args.LeaderId
+	rf.state = FOLLOWER
 	rf.gotContacted = true
 	reply.Success = true
 	reply.Term = args.Term
@@ -359,43 +368,47 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// if args.Term < rf.currentTerm {
-	// 	reply.VoteGranted = false
-	// 	reply.Term = rf.currentTerm
-	// } else if (rf.votedFor == -1 || rf.votedFor == CANDIDATE) && (rf.log[rf.lastApplied].Term < args.LastLogTerm || rf.log[rf.lastApplied].Term == args.LastLogTerm && args.LastLogIndex >= rf.lastApplied) {
-	// 	reply.VoteGranted = true
-	// 	rf.currentTerm = args.Term
-	// 	rf.gotContacted = true
-	// }
-
-	// if args.Term > rf.currentTerm {
-	// 	// need to update always
-	// 	rf.currentTerm = args.Term
-	// 	rf.leader = LEADER_UNKNOWN
-	// }
-
 	if rf.currentTerm < args.Term {
+		rf.debug("Updating term to new term %v\n", args.Term)
 		rf.currentTerm = args.Term
-		rf.leader = LEADER_UNKNOWN
+		rf.state = FOLLOWER
+		rf.votedFor = LEADER_UNKNOWN
 	}
 
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+
+	// late candidates
 	if args.Term < rf.currentTerm {
-		reply.VoteGranted = false
-		reply.Term = rf.currentTerm
-		rf.debug("Rejecting vote to %v. Reason: candidate is late in terms.\n", args.CandidateId)
-	} else if (rf.votedFor == -1 || rf.votedFor == CANDIDATE) && (rf.log[len(rf.log)-1].Term < args.LastLogTerm || rf.log[len(rf.log)-1].Term == args.LastLogTerm && args.LastLogIndex >= len(rf.log)-1) {
-		reply.VoteGranted = true
-		// rf.currentTerm = args.Term
-		rf.gotContacted = true
-		rf.debug("Granting vote to %v.\n", args.CandidateId)
-	} else {
-		reply.VoteGranted = false
-		if rf.votedFor == -1 || rf.votedFor == CANDIDATE {
-			rf.debug("Rejecting vote to %v. Reason: Log is not as up to date as self.\n", args.CandidateId)
-		} else {
-			rf.debug("Rejecting vote to %v. Reason: Already voted for someone else.\n", args.CandidateId)
-		}
+		rf.debug("Rejecting candidate %v. Reason: late term=%v\n", args.CandidateId, args.Term)
+		return
 	}
+
+	// avoid double vote
+	if rf.votedFor != -1 && rf.votedFor != rf.me {
+		rf.debug("Rejecting candidate %v. Reason: already voted\n", args.CandidateId)
+		return
+	}
+
+	lastLogIndex := len(rf.log) - 1
+
+	// reject old logs
+	if rf.log[lastLogIndex].Term > args.LastLogTerm {
+		rf.debug("Rejecting candidate %v. Reason: old log\n", args.CandidateId)
+		return
+	}
+
+	// log is smaller
+	if rf.log[lastLogIndex].Term == args.LastLogTerm && args.LastLogIndex < lastLogIndex {
+		rf.debug("Rejecting candidate %v. Reason: small log\n", args.CandidateId)
+		return
+	}
+
+	rf.votedFor = args.CandidateId
+	rf.gotContacted = true
+
+	rf.debug("Granting vote to %v\n", args.CandidateId)
+	reply.VoteGranted = true
 
 	// save state
 	rf.persist()
@@ -522,8 +535,8 @@ func (rf *Raft) leaderNotify(i, term, leaderId, prevLogIndex, prevLogTerm int, e
 		// if it is no longer the leader
 		if rf.currentTerm < reply.Term {
 			rf.debug("%v was behind in terms. Updating from term %v to term %v\n", rf.me, term, reply.Term)
-			rf.votedFor = -1           // random status
-			rf.leader = LEADER_UNKNOWN // no longer the leader
+			rf.votedFor = LEADER_UNKNOWN // random status
+			rf.state = FOLLOWER
 			rf.currentTerm = reply.Term
 			// rf.debug("Server %v Finished updating itself to have a new term %v\n", rf.me, rf.currentTerm)
 		} else if reply.Term != 0 { // this avoids the case where the connection failed
@@ -552,43 +565,60 @@ func (rf *Raft) candidateNotify(i, term, candidateId, lastLogIndex, lastLogTerm 
 	args := RequestVoteArgs{Term: term, CandidateId: candidateId, LastLogIndex: lastLogIndex, LastLogTerm: lastLogTerm}
 	reply := RequestVoteReply{}
 
-	// rf.debug("Candidate %v requesting vote to %v in term %v\n", candidateId, i, term)
 	ok := rf.sendRequestVote(i, &args, &reply)
 	if !ok {
-		// rf.debug("Server %v did not receive vote in time from %v\n", rf.me, i)
 		return
 	}
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.debug("Candidate %v received vote result from follower %v in term %v with result %v\n", candidateId, i, term, reply.VoteGranted)
-
-	if !reply.VoteGranted && rf.currentTerm < reply.Term {
-		// Candidate is late. become follower again
-		rf.debug("Candidate %v is late and will now become a follower again\n", rf.me)
-		rf.votedFor = -1 // default case because we don't know who's the leader yet
-		rf.leader = LEADER_UNKNOWN
+	// update if late
+	if rf.currentTerm < reply.Term {
+		rf.debug("Updating term to new term %v\n", args.Term)
 		rf.currentTerm = reply.Term
-		rf.gotContacted = true // reset timer
+		rf.state = FOLLOWER
+		rf.votedFor = LEADER_UNKNOWN
+		rf.gotContacted = true
+		return
+	}
 
-	} else if reply.VoteGranted && rf.votedFor != -1 {
-		rf.voteCount += 1
-		if rf.voteCount > len(rf.peers)/2 {
-			// majority, can become leader
-			rf.votedFor = -1
-			rf.voteCount = -1
-			rf.leader = rf.me
+	// election has already finished
+	if rf.isLeader() {
+		rf.debug("Received vote after stepping up. Skipping...")
+		return
+	}
+
+	// avoid unreliable communication late messages
+	if args.Term != rf.currentTerm {
+		rf.debug("Received late vote message. Skipping...")
+		return
+	}
+
+	if reply.VoteGranted {
+		rf.debug("Received vote from %v.\n", i)
+		rf.voteCount[i] = true
+
+		// count num of votes until now
+		count := 0
+		for _, v := range rf.voteCount {
+			if v {
+				count++
+			}
+		}
+
+		if count > len(rf.peers)/2 {
+			// rf.votedFor = LEADER_UNKNOWN FIXME
+			rf.state = LEADER
 
 			for i := range rf.matchIndex {
 				rf.matchIndex[i] = 0
 				rf.nextIndex[i] = len(rf.log)
-				rf.debug("Server %v next index to %v is %v\n", rf.me, i, rf.nextIndex[i])
 			}
+			rf.matchIndex[rf.me] = len(rf.log) - 1
 
-			rf.matchIndex[rf.me] = len(rf.log) - 1 // self is updated
+			rf.debug("Stepped up as leader.\n")
 
-			rf.debug("THE NEW LEADER IS %v !!!!!!!!!!!!!!!!!!!!\n", rf.me)
 			rf.broadcast()
 		}
 	}
@@ -709,8 +739,14 @@ func (rf *Raft) ticker() {
 			if !rf.gotContacted {
 				// start election
 				rf.currentTerm += 1
-				rf.votedFor = CANDIDATE
-				rf.voteCount = 1 // vote for itself
+				rf.votedFor = rf.me
+				rf.state = CANDIDATE
+
+				// reset vote count
+				for i := range rf.voteCount {
+					rf.voteCount[i] = false
+				}
+				rf.voteCount[rf.me] = true // vote for itself
 
 				rf.debug("Follower %v failed to be contacted, initiating election in term %v\n", rf.me, rf.currentTerm)
 				// request vote from all others
@@ -768,10 +804,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
-	rf.votedFor = -1
-	rf.voteCount = -1
+	rf.votedFor = LEADER_UNKNOWN
+
+	rf.voteCount = make([]bool, len(peers))
+	for i := range rf.voteCount {
+		rf.voteCount[i] = false
+	}
+
 	rf.gotContacted = false
-	rf.leader = LEADER_UNKNOWN
+	rf.state = FOLLOWER
 
 	rf.log = make([]JobEntry, 1)
 	rf.commitIndex = 0
