@@ -487,7 +487,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	rf.debug("Killed!")
 }
 
 func (rf *Raft) killed() bool {
@@ -498,46 +497,53 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) leaderNotify(i, term, leaderId, prevLogIndex, prevLogTerm int, entries []JobEntry, leaderCommit int) {
 	args := AppendEntriesArgs{Term: term, LeaderId: leaderId, PrevLogIndex: prevLogIndex, PrevLogTerm: prevLogTerm, Entries: entries, LeaderCommit: leaderCommit}
 	reply := AppendEntriesReply{}
-	// rf.debug("Leader %v contacting follower %v in term %v, sending size is %v, prevLogIndex is %v\n", leaderId, i, term, len(entries), prevLogIndex)
+
 	ok := rf.sendAppendEntries(i, &args, &reply)
+
 	if !ok {
-		// rf.debug("Leader %v did not hear from %v\n", rf.me, i)
 		return
 	}
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if !rf.isLeader() {
+	// Checkup
+	if rf.currentTerm < reply.Term {
+		rf.debug("Updating term to new term %v\n", args.Term)
+		rf.currentTerm = reply.Term
+		rf.state = FOLLOWER
+		rf.votedFor = LEADER_UNKNOWN
+		rf.gotContacted = true
 		return
 	}
 
-	rf.debug("Leader %v received message from follower %v in term %v with result %v\n", leaderId, i, term, reply.Success)
+	// stepped down in between
+	if !rf.isLeader() {
+		rf.debug("Received reply after stepping down. Skipping...")
+		return
+	}
 
-	if !reply.Success {
-		// if it is no longer the leader
-		if rf.currentTerm < reply.Term {
-			rf.debug("%v was behind in terms. Updating from term %v to term %v\n", rf.me, term, reply.Term)
-			rf.votedFor = LEADER_UNKNOWN // random status
-			rf.state = FOLLOWER
-			rf.currentTerm = reply.Term
-		} else if reply.Term != 0 { // this avoids the case where the connection failed
-			lastConflictIndex := 1
-			for i := reply.TermStart; i < len(rf.log) && i > 0 && rf.log[i].Term >= reply.ConflictTerm; i-- {
-				lastConflictIndex = i
-			}
+	// avoid unreliable communication late messages
+	if args.Term != rf.currentTerm {
+		rf.debug("Received late append reply message. Skipping...")
+		return
+	}
 
-			rf.debug("Server %v lowering next index to %v, new value %v\n", rf.me, i, lastConflictIndex)
-			rf.nextIndex[i] = lastConflictIndex
-		}
-	} else {
-		// need to update follower information
-		rf.debug("Server %v to index %v matchIndex was %v, logsize is %v\n", rf.me, i, rf.matchIndex[i], len(rf.log))
+	if reply.Success {
 		rf.matchIndex[i] = prevLogIndex + len(entries)
 		rf.nextIndex[i] = rf.matchIndex[i] + 1
-		rf.debug("Server %v new matchIndex to %v is %v\n", rf.me, i, rf.matchIndex[i])
+		rf.debug("Successful append entries to %v, next=%v\n", i, rf.nextIndex[i])
 
-		rf.checkCommit(term)
+		rf.checkCommit()
+	} else {
+		lastConflictIndex := 1
+
+		for i := reply.TermStart; i < len(rf.log) && i > 0 && rf.log[i].Term >= reply.ConflictTerm; i-- {
+			lastConflictIndex = i
+		}
+
+		rf.debug("Server %v lowering next index to %v, new value %v\n", rf.me, i, lastConflictIndex)
+		rf.nextIndex[i] = lastConflictIndex
 	}
 }
 
@@ -588,7 +594,6 @@ func (rf *Raft) candidateNotify(i, term, candidateId, lastLogIndex, lastLogTerm 
 		}
 
 		if count > len(rf.peers)/2 {
-			// rf.votedFor = LEADER_UNKNOWN FIXME
 			rf.state = LEADER
 
 			for i := range rf.matchIndex {
@@ -643,7 +648,7 @@ func (rf *Raft) updateCommit(newCommitIndex int) {
 	rf.commitIndex = newCommitIndex
 }
 
-func (rf *Raft) checkCommit(term int) {
+func (rf *Raft) checkCommit() {
 	// check if any message can be considered committed
 	if !rf.isLeader() {
 		return
@@ -664,7 +669,7 @@ func (rf *Raft) checkCommit(term int) {
 	newCommit := -1
 	for i := len(count) - 1; i > rf.commitIndex; i-- {
 		v := count[i]
-		if i > rf.commitIndex && v > len(rf.peers)/2 && rf.log[i].Term == term {
+		if i > rf.commitIndex && v > len(rf.peers)/2 && rf.log[i].Term == rf.currentTerm {
 			newCommit = i
 			break
 		}
@@ -797,12 +802,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// rf.lastApplied = 0
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
-
-	// FIXME
-	// for i := 0; i < len(peers); i++ {
-	// 	rf.nextIndex[i] = 0
-	// 	rf.matchIndex[i] = 0
-	// }
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
