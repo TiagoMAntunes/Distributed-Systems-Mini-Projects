@@ -225,22 +225,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// // Figure 2 conditions 1. and 2.
-	// if args.Term < rf.currentTerm || rf.lastApplied < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-	// 	if args.Term < rf.currentTerm {
-	// 		rf.gotContacted = true
-	// 	}
-	// 	rf.debug("Follower %v refusing append entries from %v. Term is %v and received term %v\n", rf.me, args.LeaderId, rf.currentTerm, args.Term)
-	// 	reply.Success = false
-	// 	reply.Term = rf.currentTerm
-	// 	reply.LastIndex = rf.lastApplied
-	// 	return
-	// }
-
 	// Checkup
 	if args.Term >= rf.currentTerm {
 		rf.currentTerm = args.Term
-		rf.state = FOLLOWER
 		rf.votedFor = LEADER_UNKNOWN
 		rf.state = FOLLOWER
 	}
@@ -248,13 +235,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = false
 	reply.Term = rf.currentTerm
 
+	// late leader
 	if args.Term < rf.currentTerm {
 		rf.debug("Rejecting append entries. Reason: term is behind current term.")
 		return
-	} else if len(rf.log)-1 < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	}
+
+	// not update enough
+	if len(rf.log)-1 < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		termIndex := 0
 
-		// for i, v := range rf.log {
 		for i := len(rf.log) - 1; i > 0; i-- {
 			v := rf.log[i]
 			if v.Term == args.PrevLogTerm {
@@ -288,28 +278,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		// remove all following entries and just put in the new ones
 		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
-		// rf.lastApplied = len(rf.log) - 1
-
-		// if args.PrevLogIndex < rf.commitIndex {
-		// 	rf.debug("Server %v is removing commited entries! PrevLogIndex=%v commitIndex=%v\n", rf.me, args.PrevLogIndex, rf.commitIndex)
-		// }
 	}
 
 	// get commit information
 	if args.LeaderCommit > rf.commitIndex {
 		rf.debug("Server %v leaderCommit=%v, commitIndex=%v\n", rf.me, args.LeaderCommit, rf.commitIndex)
-		prev := rf.commitIndex + 1
-		rf.commitIndex = args.LeaderCommit
-		if len(rf.log)-1 < args.LeaderCommit {
-			rf.commitIndex = len(rf.log) - 1
+		newIndex := args.LeaderCommit
 
+		// in case this server is behind the committed value
+		if len(rf.log)-1 < args.LeaderCommit {
+			newIndex = len(rf.log) - 1
 		}
-		for ; prev <= rf.commitIndex; prev++ {
-			rf.debug("Server %v sending information about %v, content=%v\n", rf.me, prev, rf.log[prev].Job)
-			msg := ApplyMsg{CommandValid: true, Command: rf.log[prev].Job, CommandIndex: prev}
-			rf.applyCh <- msg
-		}
-		rf.debug("Server %v commit index is %v\n", rf.me, rf.commitIndex)
+
+		rf.updateCommit(newIndex)
+		rf.debug("New commit index: %v\n", rf.commitIndex)
 	}
 
 	// rf.votedFor = LEADER_UNKNOWN
@@ -505,6 +487,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.debug("Killed!")
 }
 
 func (rf *Raft) killed() bool {
@@ -538,10 +521,7 @@ func (rf *Raft) leaderNotify(i, term, leaderId, prevLogIndex, prevLogTerm int, e
 			rf.votedFor = LEADER_UNKNOWN // random status
 			rf.state = FOLLOWER
 			rf.currentTerm = reply.Term
-			// rf.debug("Server %v Finished updating itself to have a new term %v\n", rf.me, rf.currentTerm)
 		} else if reply.Term != 0 { // this avoids the case where the connection failed
-			// just need to lower the next index to send
-			// rf.nextIndex[i] = reply.LastIndex + 1
 			lastConflictIndex := 1
 			for i := reply.TermStart; i < len(rf.log) && i > 0 && rf.log[i].Term >= reply.ConflictTerm; i-- {
 				lastConflictIndex = i
@@ -647,36 +627,39 @@ func (rf *Raft) broadcast() {
 	}
 }
 
+// update new commit messages and send all the messages
+func (rf *Raft) updateCommit(newCommitIndex int) {
+
+	if newCommitIndex < rf.commitIndex {
+		panic(fmt.Sprintf("Server %v: new commit index %v is lower than previous one %v\n", rf.me, newCommitIndex, rf.commitIndex))
+	}
+
+	for i := rf.commitIndex + 1; i <= newCommitIndex; i++ {
+		rf.debug("Server %v sending information about %v, content=%v\n", rf.me, i, rf.log[i].Job)
+		msg := ApplyMsg{CommandValid: true, Command: rf.log[i].Job, CommandIndex: i}
+		rf.applyCh <- msg
+	}
+
+	rf.commitIndex = newCommitIndex
+}
+
 func (rf *Raft) checkCommit(term int) {
 	// check if any message can be considered committed
-
 	if !rf.isLeader() {
 		return
 	}
 
 	count := make([]int, len(rf.log))
 
+	// increase the values of each match
 	for _, v := range rf.matchIndex {
-		//rf.debug("MatchIndex index %v has value %v\n", i, v)
 		count[v]++
 	}
 
 	// a value ahead means that it is counted before so we can do a reverse sum here
-	//rf.debug("Index %v count is %v, content=%v, term=%v\n", len(rf.log)-1, count[len(rf.log)-1], rf.log[len(rf.log)-1].Job, rf.log[len(rf.log)-1].Term)
 	for i := len(rf.log) - 2; i >= 0; i-- {
 		count[i] += count[i+1]
-		//rf.debug("Index %v count is %v, content=%v, term=%v\n", i, count[i], rf.log[i].Job, rf.log[i].Term)
 	}
-
-	// for i, v := range count {
-	// 	if i > rf.commitIndex && v > len(rf.peers)/2 && rf.log[i].Term == term {
-	// 		rf.commitIndex = i // new commit index, increases monotically
-	// 		//rf.debug("Server %v sending information about %v, content=%v\n", rf.me, i, rf.log[i].Job)
-	// 		msg := ApplyMsg{CommandValid: true, Command: rf.log[i].Job, CommandIndex: i}
-	// 		rf.applyCh <- msg
-	// 		//rf.debug("New commit index %v\n", i)
-	// 	}
-	// }
 
 	newCommit := -1
 	for i := len(count) - 1; i > rf.commitIndex; i-- {
@@ -688,13 +671,8 @@ func (rf *Raft) checkCommit(term int) {
 	}
 
 	if newCommit != -1 {
-		for i := rf.commitIndex + 1; i <= newCommit; i++ {
-			rf.debug("Server %v sending information about %v, content=%v\n", rf.me, i, rf.log[i].Job)
-			msg := ApplyMsg{CommandValid: true, Command: rf.log[i].Job, CommandIndex: i}
-			rf.applyCh <- msg
-		}
-		rf.commitIndex = newCommit
-		rf.debug("New commit index %v\n", newCommit)
+		rf.updateCommit(newCommit)
+		rf.debug("New commit index: %v\n", rf.commitIndex)
 	}
 
 }
