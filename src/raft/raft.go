@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"fmt"
 	"log"
 	"math/rand"
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -128,6 +130,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.log)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.currentTerm)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -150,6 +159,21 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var log []JobEntry
+	var votedFor int
+	var currentTerm int
+	if d.Decode(&log) != nil || d.Decode(&votedFor) != nil || d.Decode(&currentTerm) != nil {
+		panic("Error while reading persist")
+	} else {
+		rf.log = log
+		rf.votedFor = votedFor
+		rf.currentTerm = currentTerm
+	}
+
+	rf.debug("Finished read persist. Log size is now %v, last entry term is %v\n", len(rf.log), rf.log[len(rf.log)-1].Term)
 }
 
 //
@@ -206,9 +230,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// }
 
 	// Checkup
-	if args.Term > rf.currentTerm {
+	if args.Term >= rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.leader = args.LeaderId
+		rf.votedFor = -1
 	}
 
 	reply.Success = false
@@ -240,7 +265,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// has content to add
 	if len(args.Entries) > 0 {
-		rf.debug("Server %v adding new command...Log size was %v\n", rf.me, len(rf.log))
+		rf.debug("Adding new command, logsize=%v startIndex=%v\n", len(rf.log), args.PrevLogIndex+1)
 
 		// sanity check
 		j := 0
@@ -271,7 +296,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		}
 		for ; prev <= rf.commitIndex; prev++ {
-			rf.debug("Server %v sending information about %v, log size is %v\n", rf.me, prev, len(rf.log))
+			rf.debug("Server %v sending information about %v, content=%v\n", rf.me, prev, rf.log[prev].Job)
 			msg := ApplyMsg{CommandValid: true, Command: rf.log[prev].Job, CommandIndex: prev}
 			rf.applyCh <- msg
 		}
@@ -293,6 +318,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		lastTerm = v.Term
 	}
+
+	// save state
+	rf.persist()
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -369,6 +397,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	}
 
+	// save state
+	rf.persist()
 }
 
 func makeTimestamp() int64 {
@@ -441,6 +471,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.log = append(rf.log, JobEntry{Job: command, Term: term})
 	rf.matchIndex[rf.me]++
+
+	// save state
+	rf.persist()
+
 	return index, term, isLeader
 }
 
@@ -478,6 +512,10 @@ func (rf *Raft) leaderNotify(i, term, leaderId, prevLogIndex, prevLogTerm int, e
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	if !rf.isLeader() {
+		return
+	}
+
 	rf.debug("Leader %v received message from follower %v in term %v with result %v\n", leaderId, i, term, reply.Success)
 
 	if !reply.Success {
@@ -492,7 +530,7 @@ func (rf *Raft) leaderNotify(i, term, leaderId, prevLogIndex, prevLogTerm int, e
 			// just need to lower the next index to send
 			// rf.nextIndex[i] = reply.LastIndex + 1
 			lastConflictIndex := 1
-			for i := reply.TermStart; i > 0 && rf.log[i].Term >= reply.ConflictTerm; i-- {
+			for i := reply.TermStart; i < len(rf.log) && i > 0 && rf.log[i].Term >= reply.ConflictTerm; i-- {
 				lastConflictIndex = i
 			}
 
@@ -581,6 +619,10 @@ func (rf *Raft) broadcast() {
 
 func (rf *Raft) checkCommit(term int) {
 	// check if any message can be considered committed
+
+	if !rf.isLeader() {
+		return
+	}
 
 	count := make([]int, len(rf.log))
 
