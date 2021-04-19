@@ -286,7 +286,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// get commit information
 	if args.LeaderCommit > rf.commitIndex {
-		rf.debug("Server %v leaderCommit=%v, commitIndex=%v\n", rf.me, args.LeaderCommit, rf.commitIndex)
+		rf.debug("Received new commit index=%v. Prev=%v\n", args.LeaderCommit, rf.commitIndex)
 		newIndex := args.LeaderCommit
 
 		// in case this server is behind the committed value
@@ -457,7 +457,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	isLeader := rf.isLeader()
 	if !isLeader {
-		rf.debug("Server %v rejecting new command.\n", rf.me)
+		rf.debug("Rejecting new command.\n")
 		return -1, -1, false
 	}
 
@@ -635,7 +635,6 @@ func (rf *Raft) broadcast() {
 			var sendingSlice []JobEntry
 			prevLogIndex := rf.nextIndex[i] - 1
 			prevLogTerm := rf.log[prevLogIndex].Term
-			rf.debug("Server %v, %v vs %v\n", i, rf.nextIndex[i], len(rf.log)-1)
 			if rf.nextIndex[i] > len(rf.log)-1 {
 				// empty heartbeat
 				sendingSlice = nilSlice
@@ -644,6 +643,7 @@ func (rf *Raft) broadcast() {
 				sendingSlice = make([]JobEntry, len(rf.log[prevLogIndex+1:]))
 				copy(sendingSlice, rf.log[prevLogIndex+1:])
 			}
+			rf.debug("Sending append entries to %v. Size: %v\n", i, len(sendingSlice))
 			go rf.leaderNotify(i, rf.currentTerm, rf.me, prevLogIndex, prevLogTerm, sendingSlice, rf.commitIndex)
 		}
 	}
@@ -657,7 +657,7 @@ func (rf *Raft) updateCommit(newCommitIndex int) {
 	}
 
 	for i := rf.commitIndex + 1; i <= newCommitIndex; i++ {
-		rf.debug("Server %v sending information about %v, content=%v\n", rf.me, i, rf.log[i].Job)
+		rf.debug("Sending information about %v, content=%v\n", i, rf.log[i].Job)
 		msg := ApplyMsg{CommandValid: true, Command: rf.log[i].Job, CommandIndex: i}
 		rf.applyCh <- msg
 	}
@@ -748,7 +748,7 @@ func (rf *Raft) ticker() {
 				}
 				rf.voteCount[rf.me] = true // vote for itself
 
-				rf.debug("Follower %v failed to be contacted, initiating election in term %v\n", rf.me, rf.currentTerm)
+				rf.debug("Failed to be contacted, initiating election in term %v\n", rf.currentTerm)
 
 				// request vote from all others
 				for i := range rf.peers {
@@ -758,7 +758,7 @@ func (rf *Raft) ticker() {
 				}
 				sleepTime = time.Duration(1000000 * (100 + rand.Intn(200))) // 100-300ms
 			} else {
-				rf.debug("Follower %v got contacted and will sleep again...\n", rf.me)
+				rf.debug("Got contacted and will sleep again...\n")
 				sleepTime = time.Duration(1000000 * (600 + rand.Intn(350))) // 600-950ms
 			}
 			rf.gotContacted = false
