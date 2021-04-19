@@ -241,24 +241,28 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// not update enough
-	if len(rf.log)-1 < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		termIndex := 0
+	conflictTerm := -1
 
-		for i := len(rf.log) - 1; i > 0; i-- {
-			v := rf.log[i]
-			if v.Term == args.PrevLogTerm {
+	if len(rf.log)-1 < args.PrevLogIndex {
+		// log not long enough
+		conflictTerm = rf.log[len(rf.log)-1].Term
+	} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// unmatched PrevLogTerm
+		conflictTerm = rf.log[args.PrevLogIndex].Term
+	}
+
+	// find conflicting term starting point and return
+	if conflictTerm != -1 {
+		termIndex := 1 // default
+		for i := 1; i < len(rf.log); i++ {
+			if rf.log[i].Term == conflictTerm {
 				termIndex = i
-				break
-			} else if v.Term > args.PrevLogTerm {
-				// no need to continue
-				break
 			}
 		}
 
-		rf.debug("Rejecting append entries. Reason: Incompatible log. Term starts at %v", termIndex)
+		reply.ConflictTerm = conflictTerm
 		reply.TermStart = termIndex
-		reply.ConflictTerm = rf.log[termIndex].Term
+		rf.debug("Rejecting append entries. Reason: Incompatible log. Term %v starts at %v", conflictTerm, termIndex)
 		return
 	}
 
@@ -291,7 +295,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 		rf.updateCommit(newIndex)
-		rf.debug("New commit index: %v\n", rf.commitIndex)
 	}
 
 	// rf.votedFor = LEADER_UNKNOWN
@@ -367,7 +370,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// avoid double vote
-	if rf.votedFor != -1 && rf.votedFor != rf.me {
+	if rf.votedFor != LEADER_UNKNOWN && rf.votedFor != args.CandidateId {
 		rf.debug("Rejecting candidate %v. Reason: already voted\n", args.CandidateId)
 		return
 	}
@@ -389,7 +392,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.votedFor = args.CandidateId
 	rf.gotContacted = true
 
-	rf.debug("Granting vote to %v\n", args.CandidateId)
+	rf.debug("Granting vote to %v. me=(%v,%v), candidate=(%v,%v)\n", args.CandidateId, lastLogIndex, rf.log[lastLogIndex].Term, args.LastLogIndex, args.LastLogTerm)
 	reply.VoteGranted = true
 
 	// save state
@@ -458,14 +461,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false
 	}
 
-	rf.debug("Server %v Adding new command at term %v, match index is %v, content=%v\n", rf.me, rf.currentTerm, rf.matchIndex[rf.me], command)
-
 	// rf.lastApplied++
 	index := len(rf.log)
 	term := rf.currentTerm
 
 	rf.log = append(rf.log, JobEntry{Job: command, Term: term})
-	rf.matchIndex[rf.me]++
+	rf.matchIndex[rf.me]++ // This is needed for the commit check
+
+	rf.debug("Adding new command at term %v, at index  %v, content=%v\n", rf.currentTerm, index, command)
 
 	// save state
 	rf.persist()
@@ -536,14 +539,22 @@ func (rf *Raft) leaderNotify(i, term, leaderId, prevLogIndex, prevLogTerm int, e
 
 		rf.checkCommit()
 	} else {
-		lastConflictIndex := 1
+		// replace wrong term
+		newNextIndex := reply.TermStart
 
-		for i := reply.TermStart; i < len(rf.log) && i > 0 && rf.log[i].Term >= reply.ConflictTerm; i-- {
-			lastConflictIndex = i
+		// if the leader doesn't have such term start from the beginning
+		if len(rf.log)-1 < reply.TermStart || rf.log[reply.TermStart].Term != reply.ConflictTerm {
+			rf.debug("Couldn't find term obtained from reply from %v.", i)
+			newNextIndex = 1
 		}
 
-		rf.debug("Server %v lowering next index to %v, new value %v\n", rf.me, i, lastConflictIndex)
-		rf.nextIndex[i] = lastConflictIndex
+		if newNextIndex == 0 {
+			rf.debug("[WARNING] Received newNextIndex 0. Defaulting to 1 for correctness")
+			newNextIndex = 1
+		}
+
+		rf.debug("Lowering next index to %v, new value %v.\n", i, newNextIndex)
+		rf.nextIndex[i] = newNextIndex
 	}
 }
 
@@ -578,6 +589,12 @@ func (rf *Raft) candidateNotify(i, term, candidateId, lastLogIndex, lastLogTerm 
 	// avoid unreliable communication late messages
 	if args.Term != rf.currentTerm {
 		rf.debug("Received late vote message. Skipping...")
+		return
+	}
+
+	// avoid stepping up after voting
+	if rf.votedFor != rf.me {
+		rf.debug("Already voted for somebody else in this term. Skipping...")
 		return
 	}
 
@@ -646,6 +663,7 @@ func (rf *Raft) updateCommit(newCommitIndex int) {
 	}
 
 	rf.commitIndex = newCommitIndex
+	rf.debug("New commit index: %v\n", rf.commitIndex)
 }
 
 func (rf *Raft) checkCommit() {
@@ -677,7 +695,6 @@ func (rf *Raft) checkCommit() {
 
 	if newCommit != -1 {
 		rf.updateCommit(newCommit)
-		rf.debug("New commit index: %v\n", rf.commitIndex)
 	}
 
 }
@@ -732,6 +749,7 @@ func (rf *Raft) ticker() {
 				rf.voteCount[rf.me] = true // vote for itself
 
 				rf.debug("Follower %v failed to be contacted, initiating election in term %v\n", rf.me, rf.currentTerm)
+
 				// request vote from all others
 				for i := range rf.peers {
 					if i != rf.me {
@@ -754,10 +772,12 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) debug(format string, content ...interface{}) {
 	if DEBUG {
-		state := "F"
-		if rf.isLeader() {
+		var state string
+		if rf.state == FOLLOWER {
+			state = "F"
+		} else if rf.state == LEADER {
 			state = "L"
-		} else if rf.votedFor == CANDIDATE {
+		} else {
 			state = "C"
 		}
 		prefix := fmt.Sprintf("[%d:%s:%02d] ", rf.me, state, rf.currentTerm)
