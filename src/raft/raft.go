@@ -99,6 +99,7 @@ type Raft struct {
 	commitIndex int
 	nextIndex   []int
 	matchIndex  []int
+	lastApplied int
 
 	// snapshot
 	lastIncludedTerm  int
@@ -138,6 +139,8 @@ func (rf *Raft) persist(snapshot bool) {
 	e.Encode(rf.log)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.currentTerm)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	data := w.Bytes()
 
 	if snapshot {
@@ -160,12 +163,16 @@ func (rf *Raft) readPersist(data []byte) {
 	var log []JobEntry
 	var votedFor int
 	var currentTerm int
-	if d.Decode(&log) != nil || d.Decode(&votedFor) != nil || d.Decode(&currentTerm) != nil {
+	var lastIncludedIndex int
+	var lastIncludedTerm int
+	if d.Decode(&log) != nil || d.Decode(&votedFor) != nil || d.Decode(&currentTerm) != nil || d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
 		panic("Error while reading persist")
 	} else {
 		rf.log = log
 		rf.votedFor = votedFor
 		rf.currentTerm = currentTerm
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
 	}
 
 	rf.debug("Finished read persist. Log size is now %v, last entry term is %v\n", rf.lastEntryIndex(), rf.index(rf.lastEntryIndex()).Term)
@@ -188,11 +195,19 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	}
 
 	// trim log to fit the new snapshot
-	rf.log = append([]JobEntry(nil), rf.log[lastIncludedIndex-rf.lastIncludedIndex:]...)
+	if lastIncludedIndex <= rf.lastEntryIndex() && rf.index(lastIncludedIndex).Term == lastIncludedTerm {
+		rf.debug("Going to trim with new index=%v, old index=%v\n", lastIncludedIndex, rf.lastIncludedIndex)
+		rf.log = append([]JobEntry(nil), rf.log[lastIncludedIndex-rf.lastIncludedIndex:]...)
+	} else {
+		rf.debug("Trimmed log to empty, as snapshot was bigger than itself")
+		rf.log = make([]JobEntry, 0)
+	}
+
 	rf.lastIncludedIndex = lastIncludedIndex
 	rf.lastIncludedTerm = lastIncludedTerm
 	rf.snapshot = snapshot
 	rf.commitIndex = rf.lastIncludedIndex
+	rf.lastApplied = rf.lastIncludedIndex
 
 	// persist snapshot
 	rf.persist(true)
@@ -274,7 +289,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// find conflicting term starting point and return
 	if conflictTerm != -1 {
 		termIndex := 1 // default
-		for i := 1; i <= rf.lastEntryIndex(); i++ {
+		for i := rf.lastIncludedIndex + 1; i <= rf.lastEntryIndex(); i++ {
 			if rf.index(i).Term == conflictTerm {
 				termIndex = i
 			}
@@ -338,6 +353,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) index(i int) JobEntry {
+	index := i - rf.lastIncludedIndex
+	if index < 0 || index >= len(rf.log) {
+		rf.debug("Accessing invalid index %v\n", index)
+		panic("Index error")
+	}
 	return rf.log[i-rf.lastIncludedIndex]
 }
 
@@ -701,7 +721,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	rf.gotContacted = true
 	msg := ApplyMsg{SnapshotValid: true, Snapshot: args.Data, SnapshotIndex: args.LastIncludedIndex, SnapshotTerm: args.LastIncludedTerm}
-	rf.applyCh <- msg
+	rf.applyCh <- msg // TODO: should this be blocking or should it also be parallel?
 }
 
 func (rf *Raft) sendSnapshot(i, term, leaderId, lastIncludedIndex, lastIncludedTerm int, snapshot []byte) {
@@ -715,7 +735,7 @@ func (rf *Raft) sendSnapshot(i, term, leaderId, lastIncludedIndex, lastIncludedT
 	}
 
 	rf.mu.Lock()
-	rf.mu.Unlock()
+	defer rf.mu.Unlock()
 
 	// update if late
 	if rf.currentTerm < reply.Term {
@@ -739,7 +759,6 @@ func (rf *Raft) sendSnapshot(i, term, leaderId, lastIncludedIndex, lastIncludedT
 
 func (rf *Raft) broadcast() {
 	// send the log or heartbeat to each follower
-
 	for i := range rf.peers {
 		if i != rf.me {
 
@@ -760,21 +779,40 @@ func (rf *Raft) broadcast() {
 	}
 }
 
-// update new commit messages and send all the messages
+// update new commit index safely
 func (rf *Raft) updateCommit(newCommitIndex int) {
 
 	if newCommitIndex < rf.commitIndex {
 		panic(fmt.Sprintf("Server %v: new commit index %v is lower than previous one %v\n", rf.me, newCommitIndex, rf.commitIndex))
 	}
 
-	for i := rf.commitIndex + 1; i <= newCommitIndex; i++ {
-		rf.debug("Sending information about %v, content=%v\n", i, rf.index(i).Job)
-		msg := ApplyMsg{CommandValid: true, Command: rf.index(i).Job, CommandIndex: i}
-		rf.applyCh <- msg
-	}
-
 	rf.commitIndex = newCommitIndex
 	rf.debug("New commit index: %v\n", rf.commitIndex)
+}
+
+// will try to apply the log messages at every interval but dropping the lock when full
+func (rf *Raft) apply() {
+	for {
+		time.Sleep(time.Duration(1000000 * 50)) //50ms
+		rf.mu.Lock()
+		keepApplying := true
+
+		for keepApplying && rf.lastApplied < rf.commitIndex {
+			msg := ApplyMsg{CommandValid: true, Command: rf.index(rf.lastApplied + 1).Job, CommandIndex: rf.lastApplied + 1}
+
+			select {
+			case rf.applyCh <- msg:
+				// message has been sent
+				rf.debug("Sent information about %v, content=%v\n", rf.lastApplied+1, rf.index(rf.lastApplied+1).Job)
+				rf.lastApplied++
+			default:
+				// drop message
+				keepApplying = false
+			}
+		}
+
+		rf.mu.Unlock()
+	}
 }
 
 func (rf *Raft) checkCommit() {
@@ -787,6 +825,9 @@ func (rf *Raft) checkCommit() {
 
 	// increase the values of each match
 	for _, v := range rf.matchIndex {
+		if v <= rf.lastIncludedIndex {
+			continue
+		}
 		count[v-rf.lastIncludedIndex]++
 	}
 
@@ -798,7 +839,7 @@ func (rf *Raft) checkCommit() {
 	newCommit := -1
 	for j := len(count) - 1; j > rf.commitIndex-rf.lastIncludedIndex; j-- {
 		i := rf.lastIncludedIndex + j
-		v := count[i]
+		v := count[j]
 		if i > rf.commitIndex && v > len(rf.peers)/2 && rf.index(i).Term == rf.currentTerm {
 			newCommit = i
 			break
@@ -915,19 +956,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.log = make([]JobEntry, 1)
 	rf.commitIndex = 0
-	// rf.lastApplied = 0
+	rf.lastApplied = 0
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 
 	rf.lastIncludedTerm = 0
 	rf.lastIncludedIndex = 0
-	rf.snapshot = nil
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.snapshot = persister.ReadSnapshot()
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.apply()
 
 	return rf
 }
