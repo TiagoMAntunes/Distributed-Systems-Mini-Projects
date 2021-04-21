@@ -173,9 +173,11 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.currentTerm = currentTerm
 		rf.lastIncludedIndex = lastIncludedIndex
 		rf.lastIncludedTerm = lastIncludedTerm
+		rf.commitIndex = lastIncludedIndex
+		rf.lastApplied = lastIncludedIndex
 	}
 
-	rf.debug("Finished read persist. Log size is now %v, last entry term is %v\n", rf.lastEntryIndex(), rf.index(rf.lastEntryIndex()).Term)
+	rf.debug("Finished read persist. Log size is now %v, last entry term is %v, lastIncludedIndex=%v, lastIncludedTerm=%v\n", rf.lastEntryIndex(), rf.index(rf.lastEntryIndex()).Term, rf.lastIncludedIndex, rf.lastIncludedTerm)
 }
 
 //
@@ -197,7 +199,12 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	// trim log to fit the new snapshot
 	if lastIncludedIndex <= rf.lastEntryIndex() && rf.index(lastIncludedIndex).Term == lastIncludedTerm {
 		rf.debug("Going to trim with new index=%v, old index=%v\n", lastIncludedIndex, rf.lastIncludedIndex)
-		rf.log = append([]JobEntry(nil), rf.log[lastIncludedIndex-rf.lastIncludedIndex:]...)
+
+		trimIndex := lastIncludedIndex - rf.lastIncludedIndex
+		if rf.lastIncludedIndex > 0 {
+			trimIndex -= 1
+		}
+		rf.log = append([]JobEntry(nil), rf.log[trimIndex:]...)
 	} else {
 		rf.debug("Trimmed log to empty, as snapshot was bigger than itself")
 		rf.log = make([]JobEntry, 0)
@@ -212,6 +219,8 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	// persist snapshot
 	rf.persist(true)
 
+	rf.debug("Installed snapshot. commitIndex=%v, lastIncludedIndex=%v\n", rf.commitIndex, rf.lastIncludedIndex)
+
 	return true
 }
 
@@ -225,15 +234,21 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	defer rf.mu.Unlock()
 
 	// late snapshot
-	if index < rf.lastIncludedIndex {
+	if index <= rf.lastIncludedIndex {
 		rf.debug("Index too small to create snapshot")
 	}
 
 	// trim slice and reduce size
-	rf.log = append([]JobEntry(nil), rf.log[index-rf.lastIncludedIndex:]...)
+	trimIndex := index - rf.lastIncludedIndex
+	if rf.lastIncludedIndex > 0 {
+		trimIndex -= 1
+	}
+	rf.log = append([]JobEntry(nil), rf.log[trimIndex+1:]...)
 	rf.lastIncludedIndex = index
 	rf.lastIncludedTerm = rf.index(rf.lastEntryIndex()).Term
 	rf.snapshot = snapshot
+
+	rf.debug("Updated to snapshot. lastIncludedIndex=%v, logsize=%v\n", rf.lastIncludedIndex, len(rf.log))
 
 	// persist snapshot
 	rf.persist(true)
@@ -297,7 +312,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		reply.ConflictTerm = conflictTerm
 		reply.TermStart = termIndex
-		rf.debug("Rejecting append entries. Reason: Incompatible log. Term %v starts at %v", conflictTerm, termIndex)
+		rf.debug("Rejecting append entries. Reason: Incompatible log. Term %v starts at %v. Received PrevLogIndex=%v, last entry index is %v\n", conflictTerm, termIndex, args.PrevLogIndex, rf.lastEntryIndex())
 		return
 	}
 
@@ -316,7 +331,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 		// remove all following entries and just put in the new ones
-		rf.log = append(rf.log[:args.PrevLogIndex-rf.lastIncludedIndex+1], args.Entries...)
+		limit := args.PrevLogIndex - rf.lastIncludedIndex
+		if rf.lastIncludedIndex > 0 {
+			limit -= 1
+		}
+		rf.log = append(rf.log[:limit+1], args.Entries...)
 	}
 
 	// get commit information
@@ -353,15 +372,32 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) index(i int) JobEntry {
+	// in some cases, it will need to check the first entry in the snapshot, which isn't reachable
+	if i == rf.lastIncludedIndex {
+		rf.debug("Generating last snapshot entry...\n")
+		return JobEntry{Term: rf.lastIncludedTerm, Job: nil}
+	}
+
 	index := i - rf.lastIncludedIndex
+	if rf.lastIncludedIndex > 0 {
+		index -= 1
+	}
+
 	if index < 0 || index >= len(rf.log) {
-		rf.debug("Accessing invalid index %v\n", index)
+		rf.debug("Accessing invalid index %v, logsize is %v, lastIncludedIndex is %v\n", index, len(rf.log), rf.lastIncludedIndex)
 		panic("Index error")
 	}
-	return rf.log[i-rf.lastIncludedIndex]
+
+	// rf.debug("True index %v will return index %v. lastIncludedIndex=%v\n", i, index, rf.lastIncludedIndex)
+	return rf.log[index]
 }
 
 func (rf *Raft) lastEntryIndex() int {
+	if rf.lastIncludedIndex > 0 {
+		// rf.debug("Last entry with lastIncludedIndex=%v and logsize=%v has index %v\n", rf.lastIncludedIndex, len(rf.log), rf.lastIncludedIndex+len(rf.log))
+		return rf.lastIncludedIndex + len(rf.log)
+	}
+	// rf.debug("Last entry with lastIncludedIndex=%v and logsize=%v has index %v\n", rf.lastIncludedIndex, len(rf.log), rf.lastIncludedIndex+len(rf.log)-1)
 	return rf.lastIncludedIndex + len(rf.log) - 1
 }
 
@@ -586,7 +622,7 @@ func (rf *Raft) leaderNotify(i, term, leaderId, prevLogIndex, prevLogTerm int, e
 		newNextIndex := reply.TermStart
 
 		// if the leader doesn't have such term start from the beginning
-		if rf.lastEntryIndex() < reply.TermStart || rf.index(reply.TermStart).Term != reply.ConflictTerm {
+		if rf.lastEntryIndex() < reply.TermStart || reply.TermStart < rf.lastEntryIndex() || rf.index(reply.TermStart).Term != reply.ConflictTerm {
 			rf.debug("Couldn't find term obtained from reply from %v.", i)
 			newNextIndex = 1
 		}
@@ -715,13 +751,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	if args.LastIncludedIndex <= rf.lastIncludedIndex {
-		rf.debug("Outdated InstallSnapshot. Skipping...\n")
+		rf.debug("Outdated InstallSnapshot. args=%v, rf=%v\n", args.LastIncludedIndex, rf.lastIncludedIndex)
 		return
 	}
 
 	rf.gotContacted = true
 	msg := ApplyMsg{SnapshotValid: true, Snapshot: args.Data, SnapshotIndex: args.LastIncludedIndex, SnapshotTerm: args.LastIncludedTerm}
-	rf.applyCh <- msg // TODO: should this be blocking or should it also be parallel?
+	rf.debug("Applying snapshot received from %v\n", args.LeaderId)
+	go func() { rf.applyCh <- msg }() // TODO: should this be blocking or should it also be parallel?
 }
 
 func (rf *Raft) sendSnapshot(i, term, leaderId, lastIncludedIndex, lastIncludedTerm int, snapshot []byte) {
@@ -764,13 +801,18 @@ func (rf *Raft) broadcast() {
 
 			// if server has lagged behind send a snapshot
 			if rf.nextIndex[i]-1 < rf.lastIncludedIndex {
-				rf.debug("Sending snapshot to follower %v\n", i)
+				rf.debug("Sending snapshot to follower %v. NextIndex=%v, lastIndex=%v\n", i, rf.nextIndex[i], rf.lastIncludedIndex)
 
 				go rf.sendSnapshot(i, rf.currentTerm, rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, rf.snapshot)
 			} else {
 				prevLogIndex := rf.nextIndex[i] - 1
 				prevLogTerm := rf.index(prevLogIndex).Term
-				sendingSlice := append([]JobEntry(nil), rf.log[prevLogIndex-rf.lastIncludedIndex+1:]...)
+
+				index := prevLogIndex - rf.lastIncludedIndex
+				if rf.lastIncludedIndex > 0 {
+					index -= 1
+				}
+				sendingSlice := append([]JobEntry(nil), rf.log[index+1:]...)
 
 				rf.debug("Sending append entries to %v. Size: %v\n", i, len(sendingSlice))
 				go rf.leaderNotify(i, rf.currentTerm, rf.me, prevLogIndex, prevLogTerm, sendingSlice, rf.commitIndex)
@@ -796,14 +838,13 @@ func (rf *Raft) apply() {
 		time.Sleep(time.Duration(1000000 * 50)) //50ms
 		rf.mu.Lock()
 		keepApplying := true
-
 		for keepApplying && rf.lastApplied < rf.commitIndex {
 			msg := ApplyMsg{CommandValid: true, Command: rf.index(rf.lastApplied + 1).Job, CommandIndex: rf.lastApplied + 1}
 
 			select {
 			case rf.applyCh <- msg:
 				// message has been sent
-				rf.debug("Sent information about %v, content=%v\n", rf.lastApplied+1, rf.index(rf.lastApplied+1).Job)
+				rf.debug("Sent information about %v, content=%v, commitIndex=%v\n", rf.lastApplied+1, rf.index(rf.lastApplied+1).Job, rf.commitIndex)
 				rf.lastApplied++
 			default:
 				// drop message
@@ -828,7 +869,16 @@ func (rf *Raft) checkCommit() {
 		if v <= rf.lastIncludedIndex {
 			continue
 		}
-		count[v-rf.lastIncludedIndex]++
+
+		index := v - rf.lastIncludedIndex
+		if rf.lastIncludedIndex > 0 {
+			index -= 1
+		}
+
+		if index < 0 || index >= len(count) {
+			rf.debug("lastIncludedIndex=%v logsize=%v v=%v\n", rf.lastIncludedIndex, len(rf.log), v)
+		}
+		count[index]++
 	}
 
 	// a value ahead means that it is counted before so we can do a reverse sum here
@@ -837,9 +887,17 @@ func (rf *Raft) checkCommit() {
 	}
 
 	newCommit := -1
-	for j := len(count) - 1; j > rf.commitIndex-rf.lastIncludedIndex; j-- {
+	minIndex := rf.commitIndex - rf.lastIncludedIndex
+	if rf.lastIncludedIndex > 0 {
+		minIndex -= 1
+	}
+	for j := len(count) - 1; j > minIndex; j-- {
 		i := rf.lastIncludedIndex + j
+		if rf.lastIncludedIndex > 0 {
+			i += 1
+		}
 		v := count[j]
+		rf.debug("Checking i=%v, lastIncludedIndex=%v\n", i, rf.lastIncludedIndex)
 		if i > rf.commitIndex && v > len(rf.peers)/2 && rf.index(i).Term == rf.currentTerm {
 			newCommit = i
 			break
