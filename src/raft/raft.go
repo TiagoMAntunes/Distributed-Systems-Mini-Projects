@@ -649,7 +649,7 @@ func (rf *Raft) candidateNotify(i, term, candidateId, lastLogIndex, lastLogTerm 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.debug("Received vote from %v. Content: %v\n", i, reply.VoteGranted)
+	// rf.debug("Received vote from %v. Content: %v\n", i, reply.VoteGranted)
 
 	// update if late
 	if rf.currentTerm < reply.Term {
@@ -897,7 +897,7 @@ func (rf *Raft) checkCommit() {
 			i += 1
 		}
 		v := count[j]
-		rf.debug("Checking i=%v, lastIncludedIndex=%v\n", i, rf.lastIncludedIndex)
+		// rf.debug("Checking i=%v, lastIncludedIndex=%v\n", i, rf.lastIncludedIndex)
 		if i > rf.commitIndex && v > len(rf.peers)/2 && rf.index(i).Term == rf.currentTerm {
 			newCommit = i
 			break
