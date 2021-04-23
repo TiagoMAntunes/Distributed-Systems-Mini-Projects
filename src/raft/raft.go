@@ -835,7 +835,7 @@ func (rf *Raft) updateCommit(newCommitIndex int) {
 // will try to apply the log messages at every interval but dropping the lock when full
 func (rf *Raft) apply() {
 	for {
-		time.Sleep(time.Duration(1000000 * 50)) //50ms
+		time.Sleep(time.Duration(1000000 * 20)) //50ms
 		rf.mu.Lock()
 		keepApplying := true
 		for keepApplying && rf.lastApplied < rf.commitIndex {
