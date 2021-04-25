@@ -277,6 +277,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Checkup
 	if args.Term > rf.currentTerm {
+		rf.debug("Updating to new term %v\n", args.Term)
 		rf.currentTerm = args.Term
 		rf.votedFor = LEADER_UNKNOWN
 		rf.state = FOLLOWER
@@ -700,7 +701,7 @@ func (rf *Raft) candidateNotify(i, term, candidateId, lastLogIndex, lastLogTerm 
 			}
 			rf.matchIndex[rf.me] = rf.lastEntryIndex()
 
-			rf.debug("Stepped up as leader.\n")
+			rf.debug("Stepped up as leader. LastLogIndex=%v, LastLogTerm=%v\n", rf.lastEntryIndex(), rf.index(rf.lastEntryIndex()).Term)
 
 			rf.broadcast()
 		}
