@@ -32,7 +32,7 @@ import (
 	"6.824/labrpc"
 )
 
-var DEBUG = true
+var DEBUG = false
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -810,7 +810,7 @@ func (rf *Raft) send() {
 		}
 		rf.mu.Unlock()
 
-		time.Sleep(time.Millisecond * 20)
+		time.Sleep(time.Millisecond * 10)
 	}
 }
 
