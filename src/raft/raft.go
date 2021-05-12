@@ -92,7 +92,7 @@ type Raft struct {
 	votedFor     int
 	gotContacted bool
 	voteCount    []bool
-	state        int
+	state        int32
 
 	// logs
 	log         []JobEntry
@@ -105,11 +105,14 @@ type Raft struct {
 	lastIncludedTerm  int
 	lastIncludedIndex int
 	snapshot          []byte
+
+	// avoid excessive messages
+	canSend bool
 }
 
-// This function is unsafe on purpose
-func (rf *Raft) isLeader() bool {
-	return rf.state == LEADER
+func (rf *Raft) IsLeader() bool {
+	z := atomic.LoadInt32(&rf.state)
+	return z == LEADER
 }
 
 // return currentTerm and whether this server
@@ -123,7 +126,7 @@ func (rf *Raft) GetState() (int, bool) {
 	defer rf.mu.Unlock()
 
 	term = rf.currentTerm
-	isleader = rf.isLeader()
+	isleader = rf.IsLeader()
 
 	return term, isleader
 }
@@ -280,7 +283,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.debug("Updating to new term %v\n", args.Term)
 		rf.currentTerm = args.Term
 		rf.votedFor = LEADER_UNKNOWN
-		rf.state = FOLLOWER
+		atomic.StoreInt32(&rf.state, FOLLOWER)
 	}
 
 	reply.Success = false
@@ -319,14 +322,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// has content to add
 	if len(args.Entries) > 0 {
-		rf.debug("Adding new command, logsize=%v startIndex=%v\n", rf.lastEntryIndex(), args.PrevLogIndex+1)
+		rf.debug("Adding new commands, logsize=%v startIndex=%v, valus=%v\n", rf.lastEntryIndex(), args.PrevLogIndex+1, args.Entries)
 
 		// sanity check
 		j := 0
 		for i := args.PrevLogIndex + 1; i <= rf.commitIndex && j < len(args.Entries); i++ {
 			if rf.index(i).Term != args.Entries[j].Term {
 
-				panic(fmt.Sprintf("Server %v removing committed entry replacing by one from another term, i=%v, j=%v. Received prevLogIndex=%v\n Incoming values = %v\n Log value is %v\nDiffering values are %v and %v\n", rf.me, i, j, args.PrevLogIndex, args.Entries, rf.log[:i-rf.lastIncludedIndex+1], rf.index(i).Job, args.Entries[j].Job))
+				panic(fmt.Sprintf("Server %v removing committed entry replacing by one from another term, i=%v, j=%v. Received prevLogIndex=%v\n Incoming values = %v\n Log value is %v\nDiffering values are %v and %v\nReceived Arguments are %v\n", rf.me, i, j, args.PrevLogIndex, args.Entries, rf.log[:i-rf.lastIncludedIndex+1], rf.index(i).Job, args.Entries[j].Job, args))
 			}
 			j++
 		}
@@ -354,7 +357,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// rf.votedFor = LEADER_UNKNOWN
 	rf.currentTerm = args.Term
-	rf.state = FOLLOWER
+	atomic.StoreInt32(&rf.state, FOLLOWER)
 	rf.gotContacted = true
 	reply.Success = true
 	reply.Term = args.Term
@@ -441,7 +444,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.currentTerm < args.Term {
 		rf.debug("Updating term to new term %v\n", args.Term)
 		rf.currentTerm = args.Term
-		rf.state = FOLLOWER
+		atomic.StoreInt32(&rf.state, FOLLOWER)
 		rf.votedFor = LEADER_UNKNOWN
 	}
 
@@ -536,7 +539,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	isLeader := rf.isLeader()
+	isLeader := rf.IsLeader()
 	if !isLeader {
 		rf.debug("Rejecting new command.\n")
 		return -1, -1, false
@@ -552,7 +555,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// save state
 	rf.persist(false)
-
+	rf.canSend = true
 	return index, term, isLeader
 }
 
@@ -594,14 +597,14 @@ func (rf *Raft) leaderNotify(i, term, leaderId, prevLogIndex, prevLogTerm int, e
 	if rf.currentTerm < reply.Term {
 		rf.debug("Updating term to new term %v\n", args.Term)
 		rf.currentTerm = reply.Term
-		rf.state = FOLLOWER
+		atomic.StoreInt32(&rf.state, FOLLOWER)
 		rf.votedFor = LEADER_UNKNOWN
 		rf.gotContacted = true
 		return
 	}
 
 	// stepped down in between
-	if !rf.isLeader() {
+	if !rf.IsLeader() {
 		rf.debug("Received reply after stepping down. Skipping...")
 		return
 	}
@@ -656,14 +659,14 @@ func (rf *Raft) candidateNotify(i, term, candidateId, lastLogIndex, lastLogTerm 
 	if rf.currentTerm < reply.Term {
 		rf.debug("Updating term to new term %v\n", args.Term)
 		rf.currentTerm = reply.Term
-		rf.state = FOLLOWER
+		atomic.StoreInt32(&rf.state, FOLLOWER)
 		rf.votedFor = LEADER_UNKNOWN
 		rf.gotContacted = true
 		return
 	}
 
 	// election has already finished
-	if rf.isLeader() {
+	if rf.IsLeader() {
 		rf.debug("Received vote after stepping up. Skipping...")
 		return
 	}
@@ -693,7 +696,7 @@ func (rf *Raft) candidateNotify(i, term, candidateId, lastLogIndex, lastLogTerm 
 		}
 
 		if count > len(rf.peers)/2 {
-			rf.state = LEADER
+			atomic.StoreInt32(&rf.state, LEADER)
 
 			for i := range rf.matchIndex {
 				rf.matchIndex[i] = 0
@@ -739,14 +742,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// Checkup
 	if args.Term > rf.currentTerm {
 		rf.debug("Updating to new term %v\n", args.Term)
-		rf.state = FOLLOWER
+		atomic.StoreInt32(&rf.state, FOLLOWER)
 		rf.votedFor = LEADER_UNKNOWN
 		rf.currentTerm = args.Term
 		rf.gotContacted = true
 	}
 
 	// Sanity check (too many election problems already!)
-	if rf.isLeader() {
+	if rf.IsLeader() {
 		rf.debug("[ERROR] InstallSnapshot sent to leader?! Origin: %v\n", args.LeaderId)
 		return
 	}
@@ -779,14 +782,14 @@ func (rf *Raft) sendSnapshot(i, term, leaderId, lastIncludedIndex, lastIncludedT
 	if rf.currentTerm < reply.Term {
 		rf.debug("Updating term to new term %v\n", args.Term)
 		rf.currentTerm = reply.Term
-		rf.state = FOLLOWER
+		atomic.StoreInt32(&rf.state, FOLLOWER)
 		rf.votedFor = LEADER_UNKNOWN
 		rf.gotContacted = true
 		return
 	}
 
 	// unreliable message
-	if !rf.isLeader() || args.Term != rf.currentTerm {
+	if !rf.IsLeader() || args.Term != rf.currentTerm {
 		rf.debug("Received late snapshot reply. Skipping...")
 		return
 	}
@@ -795,8 +798,27 @@ func (rf *Raft) sendSnapshot(i, term, leaderId, lastIncludedIndex, lastIncludedT
 	rf.nextIndex[i] = args.LastIncludedIndex + 1
 }
 
+// accumulates messages to send faster than heartbeat for performance in lab 3
+func (rf *Raft) send() {
+
+	for !rf.killed() {
+
+		rf.mu.Lock()
+		if rf.IsLeader() && rf.canSend {
+			rf.canSend = false
+			rf.broadcast()
+		}
+		rf.mu.Unlock()
+
+		time.Sleep(time.Millisecond * 20)
+	}
+}
+
 func (rf *Raft) broadcast() {
 	// send the log or heartbeat to each follower
+	if !rf.IsLeader() {
+		panic(fmt.Sprintf("Server %v sending messages when it shouldn't. canSend is %v\n", rf.me, rf.canSend))
+	}
 	for i := range rf.peers {
 		if i != rf.me {
 
@@ -835,8 +857,8 @@ func (rf *Raft) updateCommit(newCommitIndex int) {
 
 // will try to apply the log messages at every interval but dropping the lock when full
 func (rf *Raft) apply() {
-	for {
-		time.Sleep(time.Duration(1000000 * 20)) //50ms
+	for !rf.killed() {
+		time.Sleep(time.Duration(time.Millisecond * 10)) //50ms
 		rf.mu.Lock()
 		keepApplying := true
 		for keepApplying && rf.lastApplied < rf.commitIndex {
@@ -859,7 +881,7 @@ func (rf *Raft) apply() {
 
 func (rf *Raft) checkCommit() {
 	// check if any message can be considered committed
-	if !rf.isLeader() {
+	if !rf.IsLeader() {
 		return
 	}
 
@@ -925,10 +947,11 @@ func (rf *Raft) ticker() {
 
 		rf.mu.Lock()
 		var sleepTime time.Duration
-		isLeader := rf.isLeader()
+		isLeader := rf.IsLeader()
 		if isLeader {
 			// rf.checkCommit()
 			// rf.debugCommit()
+			rf.canSend = false
 			rf.broadcast()                     // heartbeat all followers
 			sleepTime = time.Millisecond * 100 // fixed time, 10 times per second max
 		} else {
@@ -936,7 +959,8 @@ func (rf *Raft) ticker() {
 				// start election
 				rf.currentTerm += 1
 				rf.votedFor = rf.me
-				rf.state = CANDIDATE
+				atomic.StoreInt32(&rf.state, CANDIDATE)
+				// rf.state = CANDIDATE
 
 				// reset vote count
 				for i := range rf.voteCount {
@@ -1011,7 +1035,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 
 	rf.gotContacted = false
-	rf.state = FOLLOWER
+	atomic.StoreInt32(&rf.state, FOLLOWER)
 
 	rf.log = make([]JobEntry, 1)
 	rf.commitIndex = 0
@@ -1026,9 +1050,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 	rf.snapshot = persister.ReadSnapshot()
 
+	rf.canSend = false
+
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.apply()
+	go rf.send()
 
 	return rf
 }
