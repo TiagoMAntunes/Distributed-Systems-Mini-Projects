@@ -60,8 +60,8 @@ func (kv *KVServer) checkNewClient(clientId int64) {
 	if !ok {
 		kv.debug("Registered new client %v\n", clientId)
 		kv.results[clientId] = make(chan Op) // holds the command the client was waiting for last time
+		kv.clientIndex[clientId] = -1
 	}
-	kv.clientIndex[clientId] = -1
 	kv.mu.Unlock()
 }
 
@@ -74,8 +74,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		kv.checkNewClient(args.ClientId)
 		status, result := kv.doOp(Op{Type: "Get", Key: args.Key, ClientId: args.ClientId, RequestId: args.RequestId, Value: ""})
 
-		reply.Err = status
-		if status == OK {
+		// linearizability in gets requires it to only read the specific request in time
+		if status == OK && result.RequestId == args.RequestId {
 			if result.Value != "" {
 				// key found
 				reply.Err = OK
@@ -84,6 +84,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 				kv.debug("No key found for %v\n", result)
 				reply.Err = ErrNoKey
 			}
+		} else if status == OK {
+			reply.Err = ErrNotCommitted
 		}
 	} else {
 		reply.Err = ErrWrongLeader
@@ -101,9 +103,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.checkNewClient(args.ClientId)
 		status, result := kv.doOp(Op{Type: args.Op, Key: args.Key, ClientId: args.ClientId, RequestId: args.RequestId, Value: args.Value})
 
-		reply.Err = status
+		// in appends and puts we don't need to be so strict because the user can't see the info
+		// but a get after will need to see it
 		if status == OK && result.RequestId >= args.RequestId {
 			reply.Err = OK
+		} else if status == OK {
+			reply.Err = ErrNotCommitted
 		}
 	} else {
 		reply.Err = ErrWrongLeader
@@ -140,8 +145,10 @@ func (kv *KVServer) applyToStateMachine(op Op) Op {
 		switch op.Type {
 		case "Append":
 			kv.data[op.Key] += op.Value
+			kv.debug("Key=%v new value=%v\n", op.Key, kv.data[op.Key])
 		case "Put":
 			kv.data[op.Key] = op.Value
+			kv.debug("Key=%v new value=%v\n", op.Key, kv.data[op.Key])
 		case "Get":
 			// skip
 		default:
@@ -149,6 +156,7 @@ func (kv *KVServer) applyToStateMachine(op Op) Op {
 		}
 
 		kv.clientIndex[op.ClientId] = op.RequestId // update last update info
+		kv.debug("New id to client %v is %v\n", op.ClientId, op.RequestId)
 	}
 
 	// fetch the key in the case of get
@@ -167,20 +175,21 @@ func (kv *KVServer) apply() {
 		if msg.CommandValid {
 			op := msg.Command.(Op)
 
+			kv.checkNewClient(op.ClientId)
+
 			// apply command
 			result := kv.applyToStateMachine(op)
 			kv.debug("Message #%v applied to state machine.\n", msg.CommandIndex)
 
-			kv.checkNewClient(op.ClientId)
 			kv.mu.Lock()
 			writeCh := kv.results[result.ClientId]
 			kv.mu.Unlock()
 
 			select {
 			case writeCh <- result:
-				kv.debug("Message received.\n")
+				kv.debug("Message #%v received.\n", op.RequestId)
 			case <-time.After(time.Millisecond * 10):
-				kv.debug("No one to get new message, skipping\n")
+				kv.debug("No one to get message #%v, skipping\n", op.RequestId)
 
 			}
 

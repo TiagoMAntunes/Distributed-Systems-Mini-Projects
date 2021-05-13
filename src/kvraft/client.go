@@ -2,9 +2,11 @@ package kvraft
 
 import (
 	"crypto/rand"
+	"fmt"
 	"log"
 	"math/big"
 	"sync/atomic"
+	"time"
 
 	"6.824/labrpc"
 )
@@ -36,7 +38,8 @@ var DEBUG = true
 
 func (ck *Clerk) debug(format string, content ...interface{}) {
 	if DEBUG {
-		log.Printf(format, content...)
+		prefix := fmt.Sprintf("[%v] ", ck.me)
+		log.Printf(prefix+format, content...)
 	}
 }
 
@@ -59,19 +62,26 @@ func (ck *Clerk) Get(key string) string {
 
 	leader := atomic.LoadInt32(&ck.leader)
 
-	ck.servers[leader].Call("KVServer.Get", &args, &reply)
-	for reply.Err != OK {
-		if reply.Err == ErrWrongLeader {
-			leader = (leader + 1) % int32(len(ck.servers))
-			ck.debug("New leader id: %v\n", leader)
+	for {
+		ck.debug("Contacting server %v\n", leader)
+		ok := ck.servers[leader].Call("KVServer.Get", &args, &reply)
+		ck.debug("Received response from %v\n", leader)
+		if reply.Err == OK {
+			break
 		}
 
 		if reply.Err == ErrNoKey {
-			ck.debug("No key found\n")
-			return ""
+			reply.Value = ""
+			break
 		}
 
-		ck.servers[leader].Call("KVServer.Get", &args, &reply)
+		if !ok || reply.Err == ErrWrongLeader {
+			leader = (leader + 1) % int32(len(ck.servers))
+			ck.debug("Picking next leader %v\n", leader)
+		}
+
+		ck.debug("Retrying message due to %v, status was %v\n", reply.Err, ok)
+		time.Sleep(time.Millisecond * 20)
 	}
 
 	atomic.StoreInt32(&ck.leader, leader)
@@ -96,15 +106,23 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	ck.index++
 
 	leader := atomic.LoadInt32(&ck.leader)
-	ck.servers[leader].Call("KVServer.PutAppend", &args, &reply)
 
-	for reply.Err != OK {
-		if reply.Err == ErrWrongLeader {
-			leader = (leader + 1) % int32(len(ck.servers))
-			ck.debug("New leader id: %v\n", leader)
+	for {
+		ck.debug("Contacting server %v\n", leader)
+		ok := ck.servers[leader].Call("KVServer.PutAppend", &args, &reply)
+		ck.debug("Received response from %v\n", leader)
+
+		if reply.Err == OK {
+			break
 		}
 
-		ck.servers[leader].Call("KVServer.PutAppend", &args, &reply)
+		if !ok || reply.Err == ErrWrongLeader {
+			leader = (leader + 1) % int32(len(ck.servers))
+			ck.debug("Picking next leader %v\n", leader)
+		}
+
+		ck.debug("Retrying message due to %v, status was %v\n", reply.Err, ok)
+		time.Sleep(time.Millisecond * 20)
 	}
 
 	atomic.StoreInt32(&ck.leader, leader)
