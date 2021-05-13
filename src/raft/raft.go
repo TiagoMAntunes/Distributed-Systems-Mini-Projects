@@ -322,16 +322,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// has content to add
 	if len(args.Entries) > 0 {
-		rf.debug("Adding new commands, logsize=%v startIndex=%v, valus=%v\n", rf.lastEntryIndex(), args.PrevLogIndex+1, args.Entries)
+		rf.debug("Adding new commands, logsize=%v startIndex=%v, values=%v\n", rf.lastEntryIndex(), args.PrevLogIndex+1, args.Entries)
 
 		// sanity check
-		j := 0
-		for i := args.PrevLogIndex + 1; i <= rf.commitIndex && j < len(args.Entries); i++ {
+		for i, j := args.PrevLogIndex+1, 0; i <= rf.commitIndex && j < len(args.Entries); i, j = i+1, j+1 {
 			if rf.index(i).Term != args.Entries[j].Term {
 
 				panic(fmt.Sprintf("Server %v removing committed entry replacing by one from another term, i=%v, j=%v. Received prevLogIndex=%v\n Incoming values = %v\n Log value is %v\nDiffering values are %v and %v\nReceived Arguments are %v\n", rf.me, i, j, args.PrevLogIndex, args.Entries, rf.log[:i-rf.lastIncludedIndex+1], rf.index(i).Job, args.Entries[j].Job, args))
 			}
-			j++
 		}
 
 		// remove all following entries and just put in the new ones
@@ -339,7 +337,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if rf.lastIncludedIndex > 0 {
 			limit -= 1
 		}
-		rf.log = append(rf.log[:limit+1], args.Entries...)
+
+		prevSize := rf.lastEntryIndex()
+		finished := false
+		// rf.log = append(rf.log[:limit+1], args.Entries...)
+		var i, j int
+		for i, j = limit+1, 0; i < len(rf.log) && j < len(args.Entries); i, j = i+1, j+1 {
+			if rf.log[i].Term != args.Entries[j].Term {
+				rf.log = append(rf.log[:i], args.Entries[j:]...)
+				finished = true
+				break
+			}
+		}
+
+		if !finished && j < len(args.Entries) {
+			rf.debug("Adding missing entries starting at index %v, prevLog = %v, entries = %v, startIndex=%v\n", j, len(rf.log), len(args.Entries), limit)
+			rf.log = append(rf.log, args.Entries[j:]...)
+		} else if !finished && i < len(rf.log) {
+			rf.debug("Avoided network delay!\n")
+		}
+
+		if rf.lastEntryIndex() < rf.commitIndex {
+			panic(fmt.Sprintf("Server %v after log append, last entry is smaller than commit index (%v, %v). PrevLogIndex=%v, PrevLogTerm=%v, limit=%v, prevLastEntryIndex=%v, entries=%v\n", rf.me, rf.lastEntryIndex(), rf.commitIndex, args.PrevLogIndex, args.PrevLogTerm, limit, prevSize, args.Entries))
+		}
 	}
 
 	// get commit information
@@ -366,7 +386,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	lastTerm := 0
 	for i, v := range rf.log {
 		if v.Term < lastTerm {
-			panic(fmt.Sprintf("Server %v has incorrect term order at index %v. Previous term entry term was %v, new one is %v\n", rf.me, i, lastTerm, v.Term))
+			panic(fmt.Sprintf("Server %v has incorrect term order at index %v. Previous term entry term was %v, new one is %v\nLog: %v\n", rf.me, i, lastTerm, v.Term, rf.log))
 		}
 		lastTerm = v.Term
 	}
@@ -388,7 +408,7 @@ func (rf *Raft) index(i int) JobEntry {
 	}
 
 	if index < 0 || index >= len(rf.log) {
-		rf.debug("Accessing invalid index %v, logsize is %v, lastIncludedIndex is %v\n", index, len(rf.log), rf.lastIncludedIndex)
+		rf.debug("Accessing invalid index %v, logsize is %v, lastIncludedIndex is %v, commitIndex is %v\n", index, len(rf.log), rf.lastIncludedIndex, rf.commitIndex)
 		panic("Index error")
 	}
 
@@ -853,6 +873,10 @@ func (rf *Raft) updateCommit(newCommitIndex int) {
 
 	rf.commitIndex = newCommitIndex
 	rf.debug("New commit index: %v\n", rf.commitIndex)
+
+	if rf.commitIndex > rf.lastEntryIndex() {
+		panic(fmt.Sprintf("Server %v: new commit index is bigger than log size (%v, %v)\n", rf.me, rf.commitIndex, rf.lastEntryIndex()))
+	}
 }
 
 // will try to apply the log messages at every interval but dropping the lock when full
