@@ -49,136 +49,147 @@ type KVServer struct {
 
 	// Your definitions here.
 	data        map[string]string
-	results     map[int]chan Op // will store the information for a given command
-	clientIndex map[int64]int64 // stores sequential values for each client
+	results     map[int64]chan Op // because the channels did not exist, messages were never being applied. analyse this<
+	clientIndex map[int64]int64   // stores sequential values for each client
+}
+
+// creates the necessary data to handle new clients, usually their channels
+func (kv *KVServer) checkNewClient(clientId int64) {
+	kv.mu.Lock()
+	_, ok := kv.results[clientId]
+	if !ok {
+		kv.debug("Registered new client %v\n", clientId)
+		kv.results[clientId] = make(chan Op) // holds the command the client was waiting for last time
+	}
+	kv.clientIndex[clientId] = -1
+	kv.mu.Unlock()
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+	kv.debug("Get received, args=%v\n", args)
+
 	isLeader := kv.rf.IsLeader()
-	if !isLeader {
+
+	if isLeader {
+		kv.checkNewClient(args.ClientId)
+		status, result := kv.doOp(Op{Type: "Get", Key: args.Key, ClientId: args.ClientId, RequestId: args.RequestId, Value: ""})
+
+		reply.Err = status
+		if status == OK {
+			if result.Value != "" {
+				// key found
+				reply.Err = OK
+				reply.Value = result.Value
+			} else {
+				kv.debug("No key found for %v\n", result)
+				reply.Err = ErrNoKey
+			}
+		}
+	} else {
 		reply.Err = ErrWrongLeader
-		return
 	}
 
-	// get does not need to handle reliable
-
-	op := Op{Type: "Get", Key: args.Key, RequestId: args.RequestId, ClientId: args.ClientId}
-	kv.debug("New get: key=%v, value=%v, clientId=%v, requestId=%v\n", op.Key, op.Value, op.ClientId, op.RequestId)
-	status, op := kv.doOp(op)
-	if !status {
-		// message was not successful
-		reply.Err = ErrNoKey
-		return
-	}
-
-	kv.mu.Lock()
-	kv.clientIndex[args.ClientId] = args.RequestId
-	kv.mu.Unlock()
-
-	reply.Err = OK
-	reply.Value = op.Value
-
+	kv.debug("Get ended, args=%v, reply=%v\n", args, reply)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	kv.debug("Put/Append received, args=%v\n", args)
+
 	isLeader := kv.rf.IsLeader()
-	if !isLeader {
+
+	if isLeader {
+		kv.checkNewClient(args.ClientId)
+		status, result := kv.doOp(Op{Type: args.Op, Key: args.Key, ClientId: args.ClientId, RequestId: args.RequestId, Value: args.Value})
+
+		reply.Err = status
+		if status == OK && result.RequestId >= args.RequestId {
+			reply.Err = OK
+		}
+	} else {
 		reply.Err = ErrWrongLeader
-		return
 	}
 
-	// unrealiable
-	kv.mu.Lock()
-	if v, ok := kv.clientIndex[args.ClientId]; ok && args.RequestId <= v {
-		kv.debug("Returning previous value")
-		reply.Err = OK
-		kv.mu.Unlock()
-		return
-	}
-	kv.mu.Unlock()
-
-	op := Op{Type: args.Op, Key: args.Key, Value: args.Value, RequestId: args.RequestId, ClientId: args.ClientId}
-	kv.debug("New PutAppend: key=%v, value=%v, clientId=%v, requestId=%v\n", op.Key, op.Value, op.ClientId, op.RequestId)
-	status, op := kv.doOp(op)
-	kv.debug("Finished doOp")
-	if !status {
-		reply.Err = ErrNotCommitted
-		return
-	}
-
-	kv.mu.Lock()
-	kv.clientIndex[args.ClientId] = args.RequestId
-	kv.mu.Unlock()
-
-	reply.Err = OK
+	kv.debug("Put/Append ended, args=%v, reply=%v\n", args, reply)
 }
 
-func (kv *KVServer) doOp(op Op) (bool, Op) {
-	index, _, isLeader := kv.rf.Start(op)
-
-	if !isLeader {
-		return false, Op{}
-	}
-
-	kv.debug("New command index %v\n", index)
+// Initiates a command and waits for it to finish
+func (kv *KVServer) doOp(op Op) (Err, Op) {
+	kv.rf.Start(op) // value goes as null for check after
 
 	kv.mu.Lock()
-	// get channel with the committed operation
-	opCh, ok := kv.results[index]
-	if !ok {
-		opCh = make(chan Op, 1)
-		kv.results[index] = opCh
-	}
+	readCh := kv.results[op.ClientId]
 	kv.mu.Unlock()
 
+	// get the response
 	select {
-	case resOp := <-opCh:
-		// message was committed on time
-		status := resOp.RequestId == op.RequestId && resOp.ClientId == op.ClientId
-		kv.debug("Committed, returning")
-		return status, resOp
-	case <-time.After(time.Millisecond * 700):
-		kv.debug("Never arrived")
-		return false, Op{}
+	case response := <-readCh:
+		return OK, response
+	case <-time.After(2 * time.Second):
+		kv.debug("Command %v did not commit in time.\n", op)
+		return ErrNotCommitted, Op{}
 	}
 }
 
-// always running, applying the messages that come from the channel
+func (kv *KVServer) applyToStateMachine(op Op) Op {
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	// update data for writes, avoid writing old data
+	if kv.clientIndex[op.ClientId] < op.RequestId {
+		switch op.Type {
+		case "Append":
+			kv.data[op.Key] += op.Value
+		case "Put":
+			kv.data[op.Key] = op.Value
+		case "Get":
+			// skip
+		default:
+			panic(fmt.Sprintf("Unrecognized command %v\n", op))
+		}
+
+		kv.clientIndex[op.ClientId] = op.RequestId // update last update info
+	}
+
+	// fetch the key in the case of get
+	if v, ok := kv.data[op.Key]; op.Type == "Get" && ok {
+		op.Value = v
+	}
+
+	return op
+}
+
+// Receives commands from raft and applies them to the state machine
 func (kv *KVServer) apply() {
 	for {
 		msg := <-kv.applyCh // new message committed in raft
-		if !msg.CommandValid {
+		kv.debug("New message to apply %v\n", msg)
+		if msg.CommandValid {
+			op := msg.Command.(Op)
+
+			// apply command
+			result := kv.applyToStateMachine(op)
+			kv.debug("Message #%v applied to state machine.\n", msg.CommandIndex)
+
+			kv.checkNewClient(op.ClientId)
+			kv.mu.Lock()
+			writeCh := kv.results[result.ClientId]
+			kv.mu.Unlock()
+
+			select {
+			case writeCh <- result:
+				kv.debug("Message received.\n")
+			case <-time.After(time.Millisecond * 10):
+				kv.debug("No one to get new message, skipping\n")
+
+			}
+
+			// check if can snapshot
+		} else if msg.SnapshotValid {
 			// TODO
-			continue
+		} else {
+			panic(fmt.Sprintf("Received non valid message %v\n", msg))
 		}
-		index := msg.CommandIndex
-		op := msg.Command.(Op)
-
-		kv.mu.Lock()
-		kv.debug("New apply, index=%v, op=%v\n", index, op)
-
-		// apply op to state machine
-		switch op.Type {
-		case "Get":
-			op.Value = kv.data[op.Key] // obtain stored value
-		case "Put":
-			kv.data[op.Key] = op.Value
-		case "Append":
-			kv.data[op.Key] += op.Value
-		}
-
-		// set results as available
-		opCh, ok := kv.results[index]
-		if !ok {
-			opCh = make(chan Op, 1)
-			kv.results[index] = opCh
-		}
-
-		kv.mu.Unlock()
-
-		opCh <- op
-		kv.debug("Message written")
 	}
 }
 
@@ -233,7 +244,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.data = make(map[string]string)      // storage
-	kv.results = make(map[int]chan Op)     // this to ease the reply mechanism
+	kv.results = make(map[int64]chan Op)   // this to ease the reply mechanism
 	kv.clientIndex = make(map[int64]int64) // this keeps track of the index of the last operation done by the client
 
 	go kv.apply()
