@@ -1,6 +1,8 @@
 package kvraft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"log"
 	"sync"
@@ -51,15 +53,21 @@ type KVServer struct {
 	data        map[string]string
 	results     map[int64]chan Op // because the channels did not exist, messages were never being applied. analyse this<
 	clientIndex map[int64]int64   // stores sequential values for each client
+
+	lastIndex int
 }
 
 // creates the necessary data to handle new clients, usually their channels
 func (kv *KVServer) checkNewClient(clientId int64) {
 	kv.mu.Lock()
-	_, ok := kv.results[clientId]
-	if !ok {
+	_, ok1 := kv.results[clientId]
+	if !ok1 {
 		kv.debug("Registered new client %v\n", clientId)
 		kv.results[clientId] = make(chan Op) // holds the command the client was waiting for last time
+	}
+
+	_, ok2 := kv.clientIndex[clientId]
+	if !ok2 {
 		kv.clientIndex[clientId] = -1
 	}
 	kv.mu.Unlock()
@@ -181,6 +189,10 @@ func (kv *KVServer) apply() {
 			result := kv.applyToStateMachine(op)
 			kv.debug("Message #%v applied to state machine.\n", msg.CommandIndex)
 
+			if msg.CommandIndex > kv.lastIndex {
+				kv.lastIndex = msg.CommandIndex
+			}
+
 			kv.mu.Lock()
 			writeCh := kv.results[result.ClientId]
 			kv.mu.Unlock()
@@ -190,16 +202,58 @@ func (kv *KVServer) apply() {
 				kv.debug("Message #%v received.\n", op.RequestId)
 			case <-time.After(time.Millisecond * 10):
 				kv.debug("No one to get message #%v, skipping\n", op.RequestId)
-
 			}
 
-			// check if can snapshot
+			// size has exceeded
+			if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() >= kv.maxraftstate {
+				kv.debug("Snapshotting")
+				kv.mu.Lock()
+				data := kv.makeSnapshot()
+				kv.rf.Snapshot(kv.lastIndex, data) // force raft to trim itself and save the data
+				kv.mu.Unlock()
+			}
+
 		} else if msg.SnapshotValid {
-			// TODO
+			// try to install the received snapshot
+			kv.mu.Lock()
+			if kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot) {
+				kv.debug("Applying new snapshot from index %v\n", msg.SnapshotIndex)
+				data := msg.Snapshot
+				kv.loadSnapshot(data) //
+				kv.lastIndex = msg.SnapshotIndex
+
+			} else {
+				kv.debug("Invalid snapshot. Skipping\n")
+			}
+			kv.mu.Unlock()
 		} else {
 			panic(fmt.Sprintf("Received non valid message %v\n", msg))
 		}
 	}
+}
+
+// read snapshot into memory
+func (kv *KVServer) loadSnapshot(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	if d.Decode(&kv.data) != nil || d.Decode(&kv.clientIndex) != nil {
+		panic("Error while reading snapshot in kv server")
+	}
+}
+
+// save persistent memory to snapshot
+func (kv *KVServer) makeSnapshot() []byte {
+
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(kv.data)
+	e.Encode(kv.clientIndex)
+	return w.Bytes()
+
 }
 
 //
@@ -255,6 +309,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.data = make(map[string]string)      // storage
 	kv.results = make(map[int64]chan Op)   // this to ease the reply mechanism
 	kv.clientIndex = make(map[int64]int64) // this keeps track of the index of the last operation done by the client
+	kv.lastIndex = -1
+
+	kv.loadSnapshot(persister.ReadSnapshot())
 
 	go kv.apply()
 

@@ -115,6 +115,10 @@ func (rf *Raft) IsLeader() bool {
 	return z == LEADER
 }
 
+func (rf *Raft) GetRaftStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -194,24 +198,13 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	defer rf.mu.Unlock()
 
 	// change occurred in the meantime
-	if lastIncludedIndex <= rf.commitIndex {
-		rf.debug("Refusing snapshot. Reason: change occurred in the meantime")
+	if lastIncludedIndex < rf.commitIndex {
+		rf.debug("Refusing snapshot. Reason: change occurred in the meantime: %v %v\n", lastIncludedIndex, rf.commitIndex)
 		return false
 	}
 
-	// trim log to fit the new snapshot
-	if lastIncludedIndex <= rf.lastEntryIndex() && rf.index(lastIncludedIndex).Term == lastIncludedTerm {
-		rf.debug("Going to trim with new index=%v, old index=%v\n", lastIncludedIndex, rf.lastIncludedIndex)
-
-		trimIndex := lastIncludedIndex - rf.lastIncludedIndex
-		if rf.lastIncludedIndex > 0 {
-			trimIndex -= 1
-		}
-		rf.log = append([]JobEntry(nil), rf.log[trimIndex:]...)
-	} else {
-		rf.debug("Trimmed log to empty, as snapshot was bigger than itself")
-		rf.log = make([]JobEntry, 0)
-	}
+	// whatever
+	rf.log = make([]JobEntry, 0)
 
 	rf.lastIncludedIndex = lastIncludedIndex
 	rf.lastIncludedTerm = lastIncludedTerm
@@ -222,7 +215,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	// persist snapshot
 	rf.persist(true)
 
-	rf.debug("Installed snapshot. commitIndex=%v, lastIncludedIndex=%v\n", rf.commitIndex, rf.lastIncludedIndex)
+	rf.debug("Installed snapshot. commitIndex=%v, lastIncludedIndex=%v, logsize=%v\n", rf.commitIndex, rf.lastIncludedIndex, rf.lastEntryIndex())
 
 	return true
 }
@@ -297,7 +290,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	conflictTerm := -1
 
-	if rf.lastEntryIndex() < args.PrevLogIndex {
+	if rf.lastEntryIndex() < args.PrevLogIndex || args.PrevLogIndex < rf.lastIncludedIndex {
 		// log not long enough
 		conflictTerm = rf.index(rf.lastEntryIndex()).Term
 	} else if rf.index(args.PrevLogIndex).Term != args.PrevLogTerm {
@@ -408,7 +401,7 @@ func (rf *Raft) index(i int) JobEntry {
 	}
 
 	if index < 0 || index >= len(rf.log) {
-		rf.debug("Accessing invalid index %v, logsize is %v, lastIncludedIndex is %v, commitIndex is %v\n", index, len(rf.log), rf.lastIncludedIndex, rf.commitIndex)
+		rf.debug("Accessing invalid index %v, logsize is %v, lastIncludedIndex is %v, commitIndex is %v, obtained index is %v, last entry is %v\n", index, len(rf.log), rf.lastIncludedIndex, rf.commitIndex, i, rf.lastEntryIndex())
 		panic("Index error")
 	}
 
