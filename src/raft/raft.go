@@ -570,8 +570,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.persist(false)
 	rf.canSend = true
 
-	rf.broadcast()
-
 	return index, term, isLeader
 }
 
@@ -826,7 +824,7 @@ func (rf *Raft) send() {
 		}
 		rf.mu.Unlock()
 
-		time.Sleep(time.Millisecond * 10)
+		time.Sleep(time.Millisecond * 5)
 	}
 }
 
@@ -889,12 +887,12 @@ func (rf *Raft) apply() {
 				// message has been sent
 				rf.debug("Sent information about %v, content=%v, commitIndex=%v\n", rf.lastApplied+1, rf.index(rf.lastApplied+1).Job, rf.commitIndex)
 				rf.lastApplied++
-			default:
+			case <-time.After(time.Millisecond * 5):
 				// drop message
 				keepApplying = false
 			}
 		}
-
+		rf.debug("Finished committing stuff")
 		rf.mu.Unlock()
 	}
 }

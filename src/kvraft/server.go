@@ -168,15 +168,15 @@ func (kv *KVServer) doOp(op Op) (Err, Op) {
 	kv.mu.Unlock()
 
 	// get the response
-	for {
-		select {
-		case response := <-readCh:
-			return OK, response
-		case <-time.After(2 * time.Second):
-			kv.debug("Command %v did not commit in time.\n", op)
-			return ErrNotCommitted, Op{}
-		}
+
+	select {
+	case response := <-readCh:
+		return OK, response
+	case <-time.After(2 * time.Second):
+		kv.debug("Command %v did not commit in time.\n", op)
+		return ErrNotCommitted, Op{}
 	}
+
 }
 
 func (kv *KVServer) applyToStateMachine(op Op) Op {
@@ -247,7 +247,7 @@ func (kv *KVServer) apply() {
 				select {
 				case writeCh <- result:
 					kv.debug("Message #%v received.\n", op.RequestId)
-				case <-time.After(time.Millisecond * 10):
+				case <-time.After(time.Millisecond * 20):
 					kv.debug("No one to get message #%v, skipping\n", op.RequestId)
 				}
 			}()
