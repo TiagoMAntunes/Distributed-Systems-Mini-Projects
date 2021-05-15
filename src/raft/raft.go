@@ -569,6 +569,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// save state
 	rf.persist(false)
 	rf.canSend = true
+
+	rf.broadcast()
+
 	return index, term, isLeader
 }
 
@@ -954,7 +957,7 @@ func (rf *Raft) checkCommit() {
 // heartsbeats recently.
 func (rf *Raft) ticker() {
 
-	time.Sleep(time.Duration(1000000 * rand.Intn(400)))
+	time.Sleep(time.Duration(1000000 * rand.Intn(150)))
 
 	for !rf.killed() {
 

@@ -14,7 +14,7 @@ import (
 	"6.824/raft"
 )
 
-const Debug = true
+const Debug = false
 
 func (kv *KVServer) debug(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -58,19 +58,23 @@ type KVServer struct {
 }
 
 // creates the necessary data to handle new clients, usually their channels
-func (kv *KVServer) checkNewClient(clientId int64) {
-	kv.mu.Lock()
-	_, ok1 := kv.results[clientId]
+func (kv *KVServer) checkNewClient(clientId int64) chan Op {
+
+	var ch chan Op
+	var ok1 bool
+	ch, ok1 = kv.results[clientId]
 	if !ok1 {
 		kv.debug("Registered new client %v\n", clientId)
-		kv.results[clientId] = make(chan Op) // holds the command the client was waiting for last time
+		ch = make(chan Op)
+		kv.results[clientId] = ch // holds the command the client was waiting for last time
 	}
 
 	_, ok2 := kv.clientIndex[clientId]
 	if !ok2 {
 		kv.clientIndex[clientId] = -1
 	}
-	kv.mu.Unlock()
+
+	return ch
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -79,21 +83,38 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	isLeader := kv.rf.IsLeader()
 
 	if isLeader {
+		kv.mu.Lock()
 		kv.checkNewClient(args.ClientId)
-		status, result := kv.doOp(Op{Type: "Get", Key: args.Key, ClientId: args.ClientId, RequestId: args.RequestId, Value: ""})
 
-		// linearizability in gets requires it to only read the specific request in time
-		if status == OK && result.RequestId == args.RequestId {
-			if result.Value != "" {
-				// key found
-				reply.Err = OK
-				reply.Value = result.Value
-			} else {
-				kv.debug("No key found for %v\n", result)
-				reply.Err = ErrNoKey
+		// check if message was already handled
+		v, ok := kv.clientIndex[args.ClientId]
+		kv.mu.Unlock()
+
+		if ok && args.ClientId <= v {
+			// repeated request
+			kv.debug("Repeated request, args=%v\n", args)
+			reply.Err = OK
+			// fetch the key in the case of get
+			reply.Value = ""
+			if v, ok := kv.data[args.Key]; ok {
+				reply.Value = v
 			}
-		} else if status == OK {
-			reply.Err = ErrNotCommitted
+		} else {
+			status, result := kv.doOp(Op{Type: "Get", Key: args.Key, ClientId: args.ClientId, RequestId: args.RequestId, Value: ""})
+
+			// linearizability in gets requires it to only read the specific request in time
+			if status == OK && result.RequestId >= args.RequestId {
+				if result.Value != "" {
+					// key found
+					reply.Err = OK
+					reply.Value = result.Value
+				} else {
+					kv.debug("No key found for %v\n", result)
+					reply.Err = ErrNoKey
+				}
+			} else if status == OK {
+				reply.Err = ErrNotCommitted
+			}
 		}
 	} else {
 		reply.Err = ErrWrongLeader
@@ -108,15 +129,28 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	isLeader := kv.rf.IsLeader()
 
 	if isLeader {
+		kv.mu.Lock()
 		kv.checkNewClient(args.ClientId)
-		status, result := kv.doOp(Op{Type: args.Op, Key: args.Key, ClientId: args.ClientId, RequestId: args.RequestId, Value: args.Value})
 
-		// in appends and puts we don't need to be so strict because the user can't see the info
-		// but a get after will need to see it
-		if status == OK && result.RequestId >= args.RequestId {
+		// check if message was already handled
+		v, ok := kv.clientIndex[args.ClientId]
+		kv.mu.Unlock()
+
+		if ok && args.ClientId <= v {
+			// repeated request
+			kv.debug("Repeated request, args=%v\n", args)
 			reply.Err = OK
-		} else if status == OK {
-			reply.Err = ErrNotCommitted
+		} else {
+			//new request
+			status, result := kv.doOp(Op{Type: args.Op, Key: args.Key, ClientId: args.ClientId, RequestId: args.RequestId, Value: args.Value})
+
+			// in appends and puts we don't need to be so strict because the user can't see the info
+			// but a get after will need to see it
+			if status == OK && result.RequestId >= args.RequestId {
+				reply.Err = OK
+			} else if status == OK {
+				reply.Err = ErrNotCommitted
+			}
 		}
 	} else {
 		reply.Err = ErrWrongLeader
@@ -134,19 +168,18 @@ func (kv *KVServer) doOp(op Op) (Err, Op) {
 	kv.mu.Unlock()
 
 	// get the response
-	select {
-	case response := <-readCh:
-		return OK, response
-	case <-time.After(2 * time.Second):
-		kv.debug("Command %v did not commit in time.\n", op)
-		return ErrNotCommitted, Op{}
+	for {
+		select {
+		case response := <-readCh:
+			return OK, response
+		case <-time.After(2 * time.Second):
+			kv.debug("Command %v did not commit in time.\n", op)
+			return ErrNotCommitted, Op{}
+		}
 	}
 }
 
 func (kv *KVServer) applyToStateMachine(op Op) Op {
-
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
 
 	// update data for writes, avoid writing old data
 	if kv.clientIndex[op.ClientId] < op.RequestId {
@@ -167,9 +200,11 @@ func (kv *KVServer) applyToStateMachine(op Op) Op {
 		kv.debug("New id to client %v is %v\n", op.ClientId, op.RequestId)
 	}
 
-	// fetch the key in the case of get
-	if v, ok := kv.data[op.Key]; op.Type == "Get" && ok {
-		op.Value = v
+	if op.Type == "Get" {
+		// fetch the key in the case of get
+		if v, ok := kv.data[op.Key]; ok {
+			op.Value = v
+		}
 	}
 
 	return op
@@ -180,29 +215,24 @@ func (kv *KVServer) apply() {
 	for {
 		msg := <-kv.applyCh // new message committed in raft
 		kv.debug("New message to apply %v\n", msg)
+		start := time.Now()
 		if msg.CommandValid {
 			op := msg.Command.(Op)
 
-			kv.checkNewClient(op.ClientId)
+			kv.mu.Lock()
+
+			writeCh := kv.checkNewClient(op.ClientId)
 
 			// apply command
 			result := kv.applyToStateMachine(op)
+
 			kv.debug("Message #%v applied to state machine.\n", msg.CommandIndex)
 
 			if msg.CommandIndex > kv.lastIndex {
 				kv.lastIndex = msg.CommandIndex
 			}
-
-			kv.mu.Lock()
-			writeCh := kv.results[result.ClientId]
+			// writeCh := kv.results[result.ClientId]
 			kv.mu.Unlock()
-
-			select {
-			case writeCh <- result:
-				kv.debug("Message #%v received.\n", op.RequestId)
-			case <-time.After(time.Millisecond * 10):
-				kv.debug("No one to get message #%v, skipping\n", op.RequestId)
-			}
 
 			// size has exceeded
 			if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() >= kv.maxraftstate {
@@ -212,6 +242,15 @@ func (kv *KVServer) apply() {
 				kv.rf.Snapshot(kv.lastIndex, data) // force raft to trim itself and save the data
 				kv.mu.Unlock()
 			}
+
+			go func() {
+				select {
+				case writeCh <- result:
+					kv.debug("Message #%v received.\n", op.RequestId)
+				case <-time.After(time.Millisecond * 10):
+					kv.debug("No one to get message #%v, skipping\n", op.RequestId)
+				}
+			}()
 
 		} else if msg.SnapshotValid {
 			// try to install the received snapshot
@@ -229,6 +268,8 @@ func (kv *KVServer) apply() {
 		} else {
 			panic(fmt.Sprintf("Received non valid message %v\n", msg))
 		}
+		end := time.Now()
+		kv.debug("Sending message took %v\n", time.Duration(end.Sub(start)))
 	}
 }
 

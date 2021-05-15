@@ -34,7 +34,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	return ck
 }
 
-var DEBUG = true
+var DEBUG = false
 
 func (ck *Clerk) debug(format string, content ...interface{}) {
 	if DEBUG {
@@ -81,7 +81,7 @@ func (ck *Clerk) Get(key string) string {
 		}
 
 		ck.debug("Retrying message due to %v, status was %v\n", reply.Err, ok)
-		time.Sleep(time.Millisecond * 20)
+		time.Sleep(time.Millisecond * 10)
 	}
 
 	atomic.StoreInt32(&ck.leader, leader)
@@ -122,7 +122,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		}
 
 		ck.debug("Retrying message due to %v, status was %v\n", reply.Err, ok)
-		time.Sleep(time.Millisecond * 20)
+		time.Sleep(time.Millisecond * 10)
 	}
 
 	atomic.StoreInt32(&ck.leader, leader)
