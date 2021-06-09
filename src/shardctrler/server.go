@@ -188,12 +188,44 @@ func (sc *ShardCtrler) doOp(op Op) (Err, Op) {
 
 }
 
+// just return a copy of the previous configuration with a new version number
+func (sc *ShardCtrler) makeConfig() Config {
+	conf := Config{}
+	prev := sc.configs[len(sc.configs)-1]
+
+	conf.Num = prev.Num + 1
+	conf.Shards = prev.Shards
+	conf.Groups = make(map[int][]string)
+	for gid, servers := range prev.Groups {
+		conf.Groups[gid] = servers
+	}
+	return conf
+}
+
+func rebalanceShards(conf *Config) Config {
+	mean := NShards / len(conf.Groups) // Shards should be evenly distributed
+
+}
+
+func (sc *ShardCtrler) doJoin(op Op) {
+	conf := sc.makeConfig()
+
+	for gid, servers := range op.Servers {
+		conf.Groups[gid] = servers // set the groups
+
+	}
+
+	rebalanceShards(&conf)
+	sc.configs = append(sc.configs, conf)
+}
+
 func (sc *ShardCtrler) applyToStateMachine(op Op) Op {
 
 	// update data for writes, avoid writing old data
 	if sc.clientIndex[op.ClientId] < op.RequestId {
 		switch op.Type {
-		//TODO
+		case "Join":
+			sc.doJoin(op)
 		default:
 			panic(fmt.Sprintf("Unrecognized command %v\n", op))
 		}
