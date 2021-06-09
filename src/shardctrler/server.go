@@ -5,6 +5,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -21,7 +22,7 @@ type ShardCtrler struct {
 
 	maxraftstate int
 
-	data        map[string]string
+	data        map[string]string // TODO remove this (trash)
 	results     map[int64]chan Op // because the channels did not exist, messages were never being applied. analyse this<
 	clientIndex map[int64]int64   // stores sequential values for each client
 
@@ -72,18 +73,23 @@ type Op struct {
 const ErrRepeatedRequest = "ErrRepeatedRequest" // this one is a mere help for validateRequest
 
 func (sc *ShardCtrler) validateRequest(op Op) (Err, Op) {
+
 	isLeader := sc.rf.IsLeader()
 	if isLeader {
 		sc.mu.Lock()
+
 		sc.checkNewClient(op.ClientId)
 
 		// check if message was already handled
 		v, ok := sc.clientIndex[op.ClientId]
+
 		sc.mu.Unlock()
 
-		if ok && op.ClientId <= v {
+		if ok && op.RequestId <= v {
 			sc.debug("Repeated request, op=%v\n", op)
-			return ErrRepeatedRequest, Op{}
+			sc.mu.Lock()
+			defer sc.mu.Unlock()
+			return OK, sc.applyToStateMachine(op, true)
 
 		} else {
 			status, res := sc.doOp(op)
@@ -150,14 +156,11 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	sc.debug("Query started, args:=%v", args)
 
-	req := Op{Type: "Query", ClientId: args.ClientId, RequestId: args.ClientId, Num: args.Num}
+	req := Op{Type: "Query", ClientId: args.ClientId, RequestId: args.RequestId, Num: args.Num}
 
 	status, result := sc.validateRequest(req)
 
-	if status == ErrRepeatedRequest {
-		reply.Err = OK
-		// TODO
-	} else if status == OK {
+	if status == OK {
 		reply.Err = OK
 		reply.Config = result.Config
 	} else {
@@ -173,7 +176,7 @@ func (sc *ShardCtrler) doOp(op Op) (Err, Op) {
 	sc.rf.Start(op) // value goes as null for check after
 
 	sc.mu.Lock()
-	readCh := sc.results[op.ClientId]
+	readCh := sc.checkNewClient(op.ClientId)
 	sc.mu.Unlock()
 
 	// get the response
@@ -194,7 +197,7 @@ func (sc *ShardCtrler) makeConfig() Config {
 	prev := sc.configs[len(sc.configs)-1]
 
 	conf.Num = prev.Num + 1
-	conf.Shards = prev.Shards
+	conf.Shards = prev.Shards // keep the previous shards so that we can move as few as possible
 	conf.Groups = make(map[int][]string)
 	for gid, servers := range prev.Groups {
 		conf.Groups[gid] = servers
@@ -202,8 +205,95 @@ func (sc *ShardCtrler) makeConfig() Config {
 	return conf
 }
 
-func rebalanceShards(conf *Config) Config {
+// This function will rebalance the existing incomplete configuration
+// It will take into account both the previous shards state and the new groups
+func rebalanceShards(conf *Config) {
 	mean := NShards / len(conf.Groups) // Shards should be evenly distributed
+
+	// get GID -> Shards
+	gids := map[int][]int{} // needs to be a map since we have no guarantee that shards are contiguous
+
+	// add previous shards' gid
+	for _, gid := range conf.Shards {
+		if _, ok := gids[gid]; !ok {
+			// fmt.Printf("Created!\n")
+			gids[gid] = make([]int, 0)
+		}
+	}
+
+	// add new groups gids in case they are new
+	for gid := range conf.Groups {
+		if _, ok := gids[gid]; !ok {
+			gids[gid] = make([]int, 0)
+		}
+	}
+
+	for shard, gid := range conf.Shards {
+		gids[gid] = append(gids[gid], shard)
+	}
+
+	// Now calculate how many values from each gid need to be moved
+	type Combo struct {
+		gid    int
+		offset int
+	}
+	offsets := []Combo{}
+	for gid, shards := range gids {
+		offset := len(shards) - mean // get the difference
+
+		// if it's an old shard group, then completely ignore the offset and just move all of them
+		// if _, ok := conf.Groups[gid]; !ok {
+		// 	offset = len(shards)
+		// }
+		if gid == 0 {
+			// special case
+			offset = len(shards)
+		}
+
+		offsets = append(offsets, Combo{gid: gid, offset: offset})
+	}
+
+	// sort via offset in increasing order
+	sort.Slice(offsets, func(i, j int) bool {
+		return offsets[i].offset < offsets[j].offset
+	})
+	fmt.Printf("Sorted: %v\n", offsets)
+
+	// Now greedily move from the last to the first until it can't move anymore
+	for i := 0; i < len(offsets) && offsets[i].offset < 0; i++ {
+		for j := len(offsets) - 1; j > i; j-- {
+			if offsets[j].offset <= 0 {
+				continue // already moved all shards from this group
+			}
+
+			toadd := offsets[i].offset // need to get this amount of shards in this gid
+			gid := offsets[i].gid
+			target_gid := offsets[j].gid
+			target_offset := offsets[j].offset
+
+			// calculate amount to move
+			canmove := target_offset
+			if canmove > -toadd {
+				canmove = toadd
+			}
+
+			// move and trim log
+			// fmt.Printf("Handling gid=%v, target_gid=%v, canmove=%v, offset=%v, target_offset=%v\n", gid, target_gid, canmove, toadd, target_offset)
+			gids[gid] = append(gids[gid], gids[target_gid][:canmove]...)
+			gids[target_gid] = gids[target_gid][canmove:]
+			toadd -= canmove
+			offsets[j].offset -= canmove //update moved data
+			offsets[i].offset += canmove
+		}
+
+	}
+
+	// write shards
+	for gid, shards := range gids {
+		for shard := range shards {
+			conf.Shards[shard] = gid
+		}
+	}
 
 }
 
@@ -211,36 +301,43 @@ func (sc *ShardCtrler) doJoin(op Op) {
 	conf := sc.makeConfig()
 
 	for gid, servers := range op.Servers {
+		sc.debug("Gid %v servers %v\n", gid, servers)
 		conf.Groups[gid] = servers // set the groups
-
 	}
 
 	rebalanceShards(&conf)
 	sc.configs = append(sc.configs, conf)
+	sc.debug("New config: %v\n", conf)
 }
 
-func (sc *ShardCtrler) applyToStateMachine(op Op) Op {
+func (sc *ShardCtrler) applyToStateMachine(op Op, repeated bool) Op {
 
 	// update data for writes, avoid writing old data
-	if sc.clientIndex[op.ClientId] < op.RequestId {
+	if !repeated && sc.clientIndex[op.ClientId] < op.RequestId {
 		switch op.Type {
 		case "Join":
 			sc.doJoin(op)
+		case "Query":
+			//TODO do i need to do anything?
+		case "Move":
+		case "Leave":
 		default:
 			panic(fmt.Sprintf("Unrecognized command %v\n", op))
 		}
 
 		sc.clientIndex[op.ClientId] = op.RequestId // update last update info
-		sc.debug("New id to client %v is %v\n", op.ClientId, op.RequestId)
+		// sc.debug("New id to client %v is %v\n", op.ClientId, op.RequestId)
 	}
 
-	// TODO reads
-	// if op.Type == "Get" {
-	// 	// fetch the key in the case of get
-	// 	if v, ok := sc.data[op.Key]; ok {
-	// 		op.Value = v
-	// 	}
-	// }
+	// Only read is a Query
+	if op.Type == "Query" {
+		index := op.Num
+		if index == -1 || index >= len(sc.configs) {
+			index = len(sc.configs) - 1
+		}
+
+		op.Config = sc.configs[index]
+	}
 
 	return op
 }
@@ -259,7 +356,7 @@ func (sc *ShardCtrler) checkNewClient(clientId int64) chan Op {
 
 	_, ok2 := sc.clientIndex[clientId]
 	if !ok2 {
-		sc.clientIndex[clientId] = -1
+		sc.clientIndex[clientId] = 0
 	}
 
 	return ch
@@ -277,9 +374,8 @@ func (sc *ShardCtrler) apply() {
 			sc.mu.Lock()
 
 			writeCh := sc.checkNewClient(op.ClientId)
-
 			// apply command
-			result := sc.applyToStateMachine(op)
+			result := sc.applyToStateMachine(op, false)
 
 			sc.debug("Message #%v applied to state machine.\n", msg.CommandIndex)
 
@@ -380,6 +476,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 
 	sc.configs = make([]Config, 1)
 	sc.configs[0].Groups = map[int][]string{}
+	for i := range sc.configs[0].Shards {
+		sc.configs[0].Shards[i] = 0
+	}
 
 	labgob.Register(Op{})
 	sc.applyCh = make(chan raft.ApplyMsg)
