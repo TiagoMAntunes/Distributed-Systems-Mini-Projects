@@ -242,11 +242,8 @@ func rebalanceShards(conf *Config) {
 		offset := len(shards) - mean // get the difference
 
 		// if it's an old shard group, then completely ignore the offset and just move all of them
-		// if _, ok := conf.Groups[gid]; !ok {
-		// 	offset = len(shards)
-		// }
-		if gid == 0 {
-			// special case
+		if _, ok := conf.Groups[gid]; !ok {
+			fmt.Printf("Found a 罪魁祸首 %v\n", gid)
 			offset = len(shards)
 		}
 
@@ -310,6 +307,24 @@ func (sc *ShardCtrler) doJoin(op Op) {
 	sc.debug("New config: %v\n", conf)
 }
 
+func (sc *ShardCtrler) doLeave(op Op) {
+	conf := sc.makeConfig()
+
+	sc.debug("Removing %v, before %v\n", op.GIDs, conf.Groups)
+	for _, gid := range op.GIDs {
+		delete(conf.Groups, gid)
+	}
+	sc.debug("After removing %v\n", conf.Groups)
+	if len(conf.Groups) == 0 {
+		// add Group 0 when there is no configuration specified
+		conf.Groups[0] = make([]string, 0)
+	}
+
+	rebalanceShards(&conf)
+	sc.configs = append(sc.configs, conf)
+	sc.debug("New config: %v\n", conf)
+}
+
 func (sc *ShardCtrler) applyToStateMachine(op Op, repeated bool) Op {
 
 	// update data for writes, avoid writing old data
@@ -319,8 +334,8 @@ func (sc *ShardCtrler) applyToStateMachine(op Op, repeated bool) Op {
 			sc.doJoin(op)
 		case "Query":
 			//TODO do i need to do anything?
-		case "Move":
 		case "Leave":
+			sc.doLeave(op)
 		default:
 			panic(fmt.Sprintf("Unrecognized command %v\n", op))
 		}
