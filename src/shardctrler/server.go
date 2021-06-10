@@ -31,7 +31,7 @@ type ShardCtrler struct {
 	configs []Config // indexed by config num
 }
 
-const Debug = true
+const Debug = false
 
 func (sc *ShardCtrler) debug(format string, a ...interface{}) (n int, err error) {
 	if Debug {

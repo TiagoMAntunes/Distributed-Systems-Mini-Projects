@@ -6,7 +6,6 @@ package shardctrler
 
 import (
 	"crypto/rand"
-	"fmt"
 	"math/big"
 	"time"
 
@@ -52,7 +51,7 @@ func (ck *Clerk) Query(num int) Config {
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
-		fmt.Println("Waiting again...")
+		// fmt.Println("Waiting again...")
 	}
 }
 
