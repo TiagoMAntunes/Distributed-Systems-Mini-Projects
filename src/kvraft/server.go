@@ -90,15 +90,17 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		v, ok := kv.clientIndex[args.ClientId]
 		kv.mu.Unlock()
 
-		if ok && args.ClientId <= v {
+		if ok && args.RequestId <= v {
 			// repeated request
 			kv.debug("Repeated request, args=%v\n", args)
 			reply.Err = OK
 			// fetch the key in the case of get
 			reply.Value = ""
+			kv.mu.Lock()
 			if v, ok := kv.data[args.Key]; ok {
 				reply.Value = v
 			}
+			kv.mu.Unlock()
 		} else {
 			status, result := kv.doOp(Op{Type: "Get", Key: args.Key, ClientId: args.ClientId, RequestId: args.RequestId, Value: ""})
 
