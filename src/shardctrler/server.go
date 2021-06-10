@@ -243,7 +243,6 @@ func rebalanceShards(conf *Config) {
 
 		// if it's an old shard group, then completely ignore the offset and just move all of them
 		if _, ok := conf.Groups[gid]; !ok {
-			fmt.Printf("Found a 罪魁祸首 %v\n", gid)
 			offset = len(shards)
 		}
 
@@ -254,7 +253,7 @@ func rebalanceShards(conf *Config) {
 	sort.Slice(offsets, func(i, j int) bool {
 		return offsets[i].offset < offsets[j].offset
 	})
-	fmt.Printf("Sorted: %v\n", offsets)
+	// fmt.Printf("Sorted: %v\n", offsets)
 
 	// Now greedily move from the last to the first until it can't move anymore
 	for i := 0; i < len(offsets) && offsets[i].offset < 0; i++ {
@@ -263,33 +262,42 @@ func rebalanceShards(conf *Config) {
 				continue // already moved all shards from this group
 			}
 
-			toadd := offsets[i].offset // need to get this amount of shards in this gid
+			toadd := -offsets[i].offset // need to get this amount of shards in this gid
 			gid := offsets[i].gid
 			target_gid := offsets[j].gid
 			target_offset := offsets[j].offset
 
 			// calculate amount to move
 			canmove := target_offset
-			if canmove > -toadd {
+			if canmove > toadd {
 				canmove = toadd
 			}
 
 			// move and trim log
 			// fmt.Printf("Handling gid=%v, target_gid=%v, canmove=%v, offset=%v, target_offset=%v\n", gid, target_gid, canmove, toadd, target_offset)
+			// fmt.Printf("Previous state: %v\n", gids[gid])
 			gids[gid] = append(gids[gid], gids[target_gid][:canmove]...)
 			gids[target_gid] = gids[target_gid][canmove:]
-			toadd -= canmove
+			// fmt.Printf("New state: %v\n", gids[gid])
 			offsets[j].offset -= canmove //update moved data
 			offsets[i].offset += canmove
 		}
 
 	}
 
+	// fmt.Printf("Shards %v\n", conf.Shards)
+	// fmt.Printf("Gids: %v\n", gids)
 	// write shards
 	for gid, shards := range gids {
-		for shard := range shards {
+		if _, ok := conf.Groups[gid]; !ok { // avoid writing old groups used in balancing
+			// fmt.Printf("Skipping %v\n", gid)
+			continue
+		}
+
+		for _, shard := range shards {
 			conf.Shards[shard] = gid
 		}
+		// fmt.Printf("Updated: %v\n", conf.Shards)
 	}
 
 }
@@ -302,6 +310,8 @@ func (sc *ShardCtrler) doJoin(op Op) {
 		conf.Groups[gid] = servers // set the groups
 	}
 
+	delete(conf.Groups, 0) // remove 0 key  always in this case
+	sc.debug("Config groups: %v\n", conf.Groups)
 	rebalanceShards(&conf)
 	sc.configs = append(sc.configs, conf)
 	sc.debug("New config: %v\n", conf)
@@ -325,6 +335,13 @@ func (sc *ShardCtrler) doLeave(op Op) {
 	sc.debug("New config: %v\n", conf)
 }
 
+func (sc *ShardCtrler) doMove(op Op) {
+	conf := sc.makeConfig()
+
+	conf.Shards[op.Shard] = op.GID
+	sc.configs = append(sc.configs, conf)
+	sc.debug("New config: %v\n, conf")
+}
 func (sc *ShardCtrler) applyToStateMachine(op Op, repeated bool) Op {
 
 	// update data for writes, avoid writing old data
@@ -336,6 +353,8 @@ func (sc *ShardCtrler) applyToStateMachine(op Op, repeated bool) Op {
 			//TODO do i need to do anything?
 		case "Leave":
 			sc.doLeave(op)
+		case "Move":
+			sc.doMove(op)
 		default:
 			panic(fmt.Sprintf("Unrecognized command %v\n", op))
 		}
@@ -352,6 +371,7 @@ func (sc *ShardCtrler) applyToStateMachine(op Op, repeated bool) Op {
 		}
 
 		op.Config = sc.configs[index]
+		sc.debug("Config %v has content %v\n", index, op.Config)
 	}
 
 	return op
