@@ -11,6 +11,7 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"6.824/shardctrler"
 )
 
 type ShardKV struct {
@@ -22,14 +23,15 @@ type ShardKV struct {
 	gid          int
 	ctrlers      []*labrpc.ClientEnd
 	maxraftstate int // snapshot if log grows this big
+	lastIndex    int
 
 	// Your definitions here.
+	data        map[string]string
+	results     map[int64]chan Op
+	clientIndex map[int64]int64 // stores sequential values for each client
 
-	data        map[string]string // TODO remove this (trash)
-	results     map[int64]chan Op // because the channels did not exist, messages were never being applied. analyse this<
-	clientIndex map[int64]int64   // stores sequential values for each client
-
-	lastIndex int
+	config shardctrler.Config
+	mck    *shardctrler.Clerk
 }
 
 const Debug = true
@@ -40,7 +42,7 @@ func (kv *ShardKV) debug(format string, a ...interface{}) (n int, err error) {
 		if !kv.rf.IsLeader() {
 			state = "F"
 		}
-		prefix := fmt.Sprintf("[%v:%v] ", kv.me, state)
+		prefix := fmt.Sprintf("[%v:%v:%v] ", kv.gid, kv.me, state)
 		log.Printf(prefix+format, a...)
 	}
 	return
@@ -57,10 +59,19 @@ type Op struct {
 	// individual args of each command
 	Key   string
 	Value string
+
+	// reconfiguration
+	Config     shardctrler.Config
+	Data       []map[string]string // shard -> map : key -> value
+	RequestIds map[int64]int64     // Keeps track of the requests of each user to avoid repeated requests
+}
+
+func (kv *ShardKV) groupCheck(key string) bool {
+	shard := key2shard(key)
+	return kv.config.Shards[shard] == kv.gid
 }
 
 func (kv *ShardKV) validateRequest(op Op) (Err, Op) {
-
 	isLeader := kv.rf.IsLeader()
 	if isLeader {
 		kv.mu.Lock()
@@ -70,9 +81,13 @@ func (kv *ShardKV) validateRequest(op Op) (Err, Op) {
 		// check if message was already handled
 		v, ok := kv.clientIndex[op.ClientId]
 
+		validGroup := kv.groupCheck(op.Key)
+
 		kv.mu.Unlock()
 
-		if ok && op.RequestId <= v {
+		if !validGroup {
+			return ErrWrongGroup, Op{}
+		} else if ok && op.RequestId <= v {
 			kv.debug("Repeated request, op=%v\n", op)
 			kv.mu.Lock()
 			defer kv.mu.Unlock()
@@ -155,6 +170,8 @@ func (kv *ShardKV) applyToStateMachine(op Op, repeated bool) Op {
 			kv.debug("Key=%v new value=%v\n", op.Key, kv.data[op.Key])
 		case "Get":
 			// skip
+		case "Configuration":
+			// TODO update data with missing shards
 		default:
 			panic(fmt.Sprintf("Unrecognized command %v\n", op))
 		}
@@ -255,6 +272,56 @@ func (kv *ShardKV) apply() {
 	}
 }
 
+func (kv *ShardKV) reconfigure(conf *shardctrler.Config) {
+	// Message to be committed across self gid
+	state := Op{
+		Type:       "Configuration",
+		Config:     *conf,
+		Data:       make([]map[string]string, 0),
+		RequestIds: make(map[int64]int64),
+	}
+
+	// Calculate relevant moving shards (incoming ones)
+	shards := make([]int, 0)
+	for i := range conf.Shards {
+		if conf.Shards[i] == kv.gid && conf.Shards[i] != kv.config.Shards[i] {
+			shards = append(shards, i)
+		}
+	}
+
+	// get the shards values from other gids
+	// TODO perform an rpc call to get them
+
+	// Merge contents
+
+	kv.doOp(state) // commit it and wait for it to finish or simply move on if in a partition
+}
+
+// polls a new config every interval and triggers a config update if it changed
+func (kv *ShardKV) pollConfig() {
+	const duration = time.Millisecond * 100
+	for {
+		// only leader needs to take into account this
+		if !kv.rf.IsLeader() {
+			time.Sleep(time.Millisecond * 500)
+			continue
+		}
+
+		// poll
+		conf := kv.mck.Query(-1)
+
+		kv.mu.Lock()
+		if conf.Num != kv.config.Num {
+			kv.debug("Found new configuration, updating...")
+			kv.reconfigure(&conf)
+			kv.config = conf
+		}
+		kv.mu.Unlock()
+
+		time.Sleep(duration)
+	}
+}
+
 // read snapshot into memory
 func (kv *ShardKV) loadSnapshot(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
@@ -333,7 +400,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// Your initialization code here.
 
 	// Use something like this to talk to the shardctrler:
-	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
+	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -346,6 +413,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.loadSnapshot(persister.ReadSnapshot())
 
 	go kv.apply()
+	go kv.pollConfig()
 
 	return kv
 }
