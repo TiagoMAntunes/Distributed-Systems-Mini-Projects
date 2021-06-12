@@ -47,3 +47,13 @@ type GetReply struct {
 	Err   Err
 	Value string
 }
+
+type GetShardsArgs struct {
+	Shards []int
+}
+
+type GetShardsReply struct {
+	Err      Err
+	Data     map[string]string
+	Requests map[int64]int64
+}
