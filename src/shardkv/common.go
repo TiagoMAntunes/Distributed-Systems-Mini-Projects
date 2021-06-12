@@ -49,7 +49,8 @@ type GetReply struct {
 }
 
 type GetShardsArgs struct {
-	Shards []int
+	NewConfigNum int
+	Shards       []int
 }
 
 type GetShardsReply struct {

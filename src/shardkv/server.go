@@ -14,6 +14,11 @@ import (
 	"6.824/shardctrler"
 )
 
+type Result struct {
+	Err Err
+	Op  Op
+}
+
 type ShardKV struct {
 	mu           sync.Mutex
 	me           int
@@ -27,8 +32,9 @@ type ShardKV struct {
 
 	// Your definitions here.
 	data        map[string]string
-	results     map[int64]chan Op
+	results     map[int64]chan Result
 	clientIndex map[int64]int64 // stores sequential values for each client
+	stop        bool
 
 	config shardctrler.Config
 	mck    *shardctrler.Clerk
@@ -72,35 +78,8 @@ func (kv *ShardKV) groupCheck(key string) bool {
 }
 
 func (kv *ShardKV) validateRequest(op Op) (Err, Op) {
-	isLeader := kv.rf.IsLeader()
-	if isLeader {
-		kv.mu.Lock()
-
-		kv.checkNewClient(op.ClientId)
-
-		// check if message was already handled
-		v, ok := kv.clientIndex[op.ClientId]
-
-		validGroup := kv.groupCheck(op.Key)
-
-		kv.mu.Unlock()
-
-		if !validGroup {
-			return ErrWrongGroup, Op{}
-		} else if ok && op.RequestId <= v {
-			kv.debug("Repeated request, op=%v\n", op)
-			kv.mu.Lock()
-			defer kv.mu.Unlock()
-			return OK, kv.applyToStateMachine(op, true)
-
-		} else {
-			status, res := kv.doOp(op)
-			if status != OK || res.RequestId < op.RequestId {
-				return ErrNotCommitted, Op{} // late reply?
-			} else {
-				return OK, res
-			}
-		}
+	if kv.rf.IsLeader() {
+		return kv.doOp(op)
 	} else {
 		return ErrWrongLeader, Op{}
 	}
@@ -147,17 +126,21 @@ func (kv *ShardKV) doOp(op Op) (Err, Op) {
 
 	// get the response
 
-	select {
-	case response := <-readCh:
-		return OK, response
-	case <-time.After(2 * time.Second):
-		kv.debug("Command %v did not commit in time.\n", op)
-		return ErrNotCommitted, Op{}
+	for {
+		select {
+		case response := <-readCh:
+			if response.Op.RequestId < op.RequestId || response.Op.Type != op.Type {
+				continue
+			}
+			return response.Err, response.Op
+		case <-time.After(2 * time.Second):
+			kv.debug("Command %v did not commit in time.\n", op)
+			return ErrNotCommitted, Op{}
+		}
 	}
-
 }
 
-func (kv *ShardKV) applyToStateMachine(op Op, repeated bool) Op {
+func (kv *ShardKV) applyToStateMachine(op Op) (Err, Op) {
 
 	// handle reconfig which is a special case
 	if op.Type == "Configuration" {
@@ -171,10 +154,13 @@ func (kv *ShardKV) applyToStateMachine(op Op, repeated bool) Op {
 				kv.clientIndex[k] = v
 			}
 		}
+		return OK, op
+	} else if !kv.groupCheck(op.Key) {
+		return ErrWrongGroup, Op{}
 	}
 
 	// update data for writes, avoid writing old data
-	if !repeated && kv.clientIndex[op.ClientId] < op.RequestId {
+	if kv.clientIndex[op.ClientId] < op.RequestId {
 		switch op.Type {
 		case "Append":
 			kv.data[op.Key] += op.Value
@@ -199,18 +185,16 @@ func (kv *ShardKV) applyToStateMachine(op Op, repeated bool) Op {
 		}
 	}
 
-	return op
+	return OK, op
 }
 
 // creates the necessary data to handle new clients, usually their channels
-func (kv *ShardKV) checkNewClient(clientId int64) chan Op {
+func (kv *ShardKV) checkNewClient(clientId int64) chan Result {
 
-	var ch chan Op
-	var ok1 bool
-	ch, ok1 = kv.results[clientId]
+	ch, ok1 := kv.results[clientId]
 	if !ok1 {
 		kv.debug("Registered new client %v\n", clientId)
-		ch = make(chan Op)
+		ch = make(chan Result)
 		kv.results[clientId] = ch // holds the command the client was waiting for last time
 	}
 
@@ -233,16 +217,23 @@ func (kv *ShardKV) apply() {
 
 			kv.mu.Lock()
 
+			for kv.stop {
+				kv.mu.Unlock()
+				time.Sleep(time.Millisecond * 30)
+				kv.mu.Lock()
+			}
+
 			writeCh := kv.checkNewClient(op.ClientId)
+
 			// apply command
-			result := kv.applyToStateMachine(op, false)
+			err, result := kv.applyToStateMachine(op)
 
 			kv.debug("Message #%v applied to state machine.\n", msg.CommandIndex)
 
 			if msg.CommandIndex > kv.lastIndex {
 				kv.lastIndex = msg.CommandIndex
 			}
-			// writeCh := kv.results[result.ClientId]
+
 			kv.mu.Unlock()
 
 			// size has exceeded
@@ -256,7 +247,7 @@ func (kv *ShardKV) apply() {
 
 			go func() {
 				select {
-				case writeCh <- result:
+				case writeCh <- Result{Err: err, Op: result}:
 					kv.debug("Message #%v received.\n", op.RequestId)
 				case <-time.After(time.Millisecond * 20):
 					kv.debug("No one to get message #%v, skipping\n", op.RequestId)
@@ -292,6 +283,13 @@ func (kv *ShardKV) GetShards(args *GetShardsArgs, reply *GetShardsReply) {
 		return
 	}
 
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if args.NewConfigNum != kv.config.Num {
+		kv.stop = true // wait for configuration update after completing this function
+	}
+
 	set := make(map[int]bool)
 	for _, v := range args.Shards {
 		set[v] = true
@@ -299,9 +297,6 @@ func (kv *ShardKV) GetShards(args *GetShardsArgs, reply *GetShardsReply) {
 
 	reply.Data = make(map[string]string)
 	reply.Requests = make(map[int64]int64)
-
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
 
 	// add the corresponding data
 	for k, v := range kv.data {
@@ -360,7 +355,7 @@ func (kv *ShardKV) reconfigure(conf shardctrler.Config) {
 		go func(gid int, s []int, wg *sync.WaitGroup, prevConf shardctrler.Config, gidch chan<- map[string]string, userch chan<- map[int64]int64) {
 			defer wg.Done()
 
-			args := GetShardsArgs{Shards: s}
+			args := GetShardsArgs{Shards: s, NewConfigNum: conf.Num}
 			reply := GetShardsReply{}
 
 			for { // keep trying until success
@@ -439,16 +434,22 @@ func (kv *ShardKV) pollConfig() {
 		// poll
 		conf := kv.mck.Query(-1)
 		kv.mu.Lock()
-		num := kv.config.Num
+		status := conf.Num != kv.config.Num
+		if status {
+			// signal stop to all threads so that they avoid committing while config is changing
+			kv.stop = true
+		}
 		kv.mu.Unlock()
 
-		if conf.Num != num {
+		if status {
 			kv.debug("Found new configuration %v, updating...", conf)
 			kv.reconfigure(conf)
 			kv.debug("Done reconfiguring")
-			// kv.mu.Lock()
-			// kv.config = conf
-			// kv.mu.Unlock()
+
+			// broadcast free
+			kv.mu.Lock()
+			kv.stop = false
+			kv.mu.Unlock()
 		}
 
 		time.Sleep(duration)
@@ -538,10 +539,11 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	kv.data = make(map[string]string)      // storage
-	kv.results = make(map[int64]chan Op)   // this to ease the reply mechanism
-	kv.clientIndex = make(map[int64]int64) // this keeps track of the index of the last operation done by the client
+	kv.data = make(map[string]string)        // storage
+	kv.results = make(map[int64]chan Result) // this to ease the reply mechanism
+	kv.clientIndex = make(map[int64]int64)   // this keeps track of the index of the last operation done by the client
 	kv.lastIndex = -1
+	kv.stop = false
 
 	kv.loadSnapshot(persister.ReadSnapshot())
 
