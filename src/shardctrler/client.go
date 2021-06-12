@@ -7,6 +7,7 @@ package shardctrler
 import (
 	"crypto/rand"
 	"math/big"
+	"sync/atomic"
 	"time"
 
 	"6.824/labrpc"
@@ -25,6 +26,14 @@ func nrand() int64 {
 	return x
 }
 
+func (ck *Clerk) increment() {
+	atomic.AddInt64(&ck.reqid, 1)
+}
+
+func (ck *Clerk) counter() int64 {
+	return atomic.LoadInt64(&ck.reqid)
+}
+
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
@@ -38,8 +47,8 @@ func (ck *Clerk) Query(num int) Config {
 	// Your code here.
 	args.Num = num
 	args.ClientId = ck.me
-	args.RequestId = ck.reqid
-	ck.reqid++
+	args.RequestId = ck.counter()
+	ck.increment()
 
 	for {
 		// try each known server.
@@ -60,8 +69,8 @@ func (ck *Clerk) Join(servers map[int][]string) {
 	// Your code here.
 	args.Servers = servers
 	args.ClientId = ck.me
-	args.RequestId = ck.reqid
-	ck.reqid++
+	args.RequestId = ck.counter()
+	ck.increment()
 
 	for {
 		// try each known server.
@@ -81,8 +90,8 @@ func (ck *Clerk) Leave(gids []int) {
 	// Your code here.
 	args.GIDs = gids
 	args.ClientId = ck.me
-	args.RequestId = ck.reqid
-	ck.reqid++
+	args.RequestId = ck.counter()
+	ck.increment()
 
 	for {
 		// try each known server.
@@ -102,8 +111,8 @@ func (ck *Clerk) Move(shard int, gid int) {
 	// Your code here.
 	args.Shard = shard
 	args.GID = gid
-	args.RequestId = ck.reqid
-	ck.reqid++
+	args.RequestId = ck.counter()
+	ck.increment()
 
 	for {
 		// try each known server.

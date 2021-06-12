@@ -1,5 +1,7 @@
 package shardkv
 
+import "6.824/shardctrler"
+
 //
 // Sharded key/value server.
 // Lots of replica groups, each running op-at-a-time paxos.
@@ -49,8 +51,8 @@ type GetReply struct {
 }
 
 type GetShardsArgs struct {
-	NewConfigNum int
-	Shards       []int
+	Config shardctrler.Config
+	Shards []int
 }
 
 type GetShardsReply struct {
