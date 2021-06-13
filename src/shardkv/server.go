@@ -48,12 +48,13 @@ type ShardKV struct {
 const Debug = true
 
 func (kv *ShardKV) debug(format string, a ...interface{}) (n int, err error) {
-	if !kv.rf.IsLeader() { // only the leaders will be doing stuff anyway
-		return
-	}
 	if Debug {
 		num := atomic.LoadInt32(&kv.num)
-		prefix := fmt.Sprintf("[%v:%v:%v] ", kv.gid, kv.me, num)
+		state := "F"
+		if kv.rf.IsLeader() {
+			state = "L"
+		}
+		prefix := fmt.Sprintf("[%v:%v:%v:%v] ", kv.gid, kv.me, state, num)
 		log.Printf(prefix+format, a...)
 	}
 	return
@@ -82,7 +83,9 @@ type Op struct {
 
 func (kv *ShardKV) groupCheck(key string) bool {
 	shard := key2shard(key)
-	return kv.config.Shards[shard] == kv.gid
+	res := kv.config.Shards[shard] == kv.gid
+	kv.debug("Group Check: %v == %v ? %v\n", kv.config.Shards[shard], kv.gid, res)
+	return res
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -170,7 +173,7 @@ func (kv *ShardKV) getDataToSend(op Op) Op {
 func (kv *ShardKV) applyToStateMachine(op Op) (Err, Op) {
 
 	// filter wrong group keys
-	if op.Type == "PutAppend" || op.Type == "Get" {
+	if (op.Type == "Put") || (op.Type == "Append") || (op.Type == "Get") {
 
 		// wrong key
 		if !kv.groupCheck(op.Key) {
@@ -223,9 +226,9 @@ func (kv *ShardKV) applyToStateMachine(op Op) (Err, Op) {
 			}
 
 			// Need to stop replying to all requests until configuration updated
-			if op.Config.Num > kv.config.Num {
+			if op.Config.Num >= kv.config.Num {
 				kv.stop = op.Config.Num
-				kv.debug("Stopped accepting requests")
+				kv.debug("New stop: %v\n", kv.stop)
 			}
 		default:
 			panic(fmt.Sprintf("Unrecognized command %v\n", op))
@@ -327,12 +330,15 @@ func (kv *ShardKV) apply() {
 }
 
 func (kv *ShardKV) getCounter() int64 {
-	return atomic.AddInt64(&kv.counter, 1)
+	// return atomic.AddInt64(&kv.counter, 1)
+	kv.counter++
+	return kv.counter
 }
 
 // Returns the shards and user indices to keep track of them
 func (kv *ShardKV) GetShards(args *GetShardsArgs, reply *GetShardsReply) {
 
+	kv.mu.Lock()
 	op := Op{
 		Type:      "GetShards",
 		Config:    args.Config,
@@ -340,6 +346,7 @@ func (kv *ShardKV) GetShards(args *GetShardsArgs, reply *GetShardsReply) {
 		RequestId: kv.getCounter(),
 		ClientId:  1, // special id
 	}
+	kv.mu.Unlock()
 
 	err, res := kv.doOp(op)
 
@@ -398,12 +405,12 @@ func (kv *ShardKV) reconfigure(conf shardctrler.Config) {
 	}
 
 	wg.Wait()
-
 	// Merge replies
 
 	for gid, ch := range gidChannels {
 		select {
 		case content := <-ch: // should not be blocking...
+			kv.debug("Obtained from %v: %v\n", gid, content)
 			for k, v := range content {
 				op.Data[k] = v // we just substitute because all the data is coming and we don't have the data here (and this is the most updated one supposedly...)
 			}
@@ -423,7 +430,7 @@ func (kv *ShardKV) reconfigure(conf shardctrler.Config) {
 			}
 			kv.debug("Merged users from gid %v\n", gid)
 		default:
-			kv.debug("No data for gid %v\n", gid)
+			kv.debug("No user index for gid %v\n", gid)
 		}
 	}
 
@@ -469,9 +476,14 @@ func (kv *ShardKV) callServer(gid int, s []int, wg *sync.WaitGroup, prevConf, co
 
 // polls a new config every interval and triggers a config update if it changed
 func (kv *ShardKV) pollConfig() {
-	const duration = time.Millisecond * 1000
+	const duration = time.Millisecond * 100
 
 	for {
+		time.Sleep(duration)
+
+		if !kv.rf.IsLeader() {
+			continue
+		}
 
 		// get current config value
 		kv.mu.Lock()
@@ -485,8 +497,6 @@ func (kv *ShardKV) pollConfig() {
 			// new configuration detected
 			kv.reconfigure(conf)
 		}
-
-		time.Sleep(duration)
 	}
 }
 
@@ -501,6 +511,8 @@ func (kv *ShardKV) loadSnapshot(data []byte) {
 	if d.Decode(&kv.data) != nil || d.Decode(&kv.clientIndex) != nil || d.Decode(&kv.config) != nil || d.Decode(&kv.stop) != nil || d.Decode(&kv.counter) != nil {
 		panic("Error while reading snapshot in kv server")
 	}
+
+	atomic.StoreInt32(&kv.num, int32(kv.config.Num))
 }
 
 // save persistent memory to snapshot
@@ -526,6 +538,7 @@ func (kv *ShardKV) makeSnapshot() []byte {
 func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+	kv.debug("Killed %v\n", kv.me)
 }
 
 //
@@ -582,6 +595,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.lastIndex = -1
 
 	kv.loadSnapshot(persister.ReadSnapshot())
+
+	kv.debug("Starting %v\n", kv.me)
 
 	go kv.apply()
 	go kv.pollConfig()
