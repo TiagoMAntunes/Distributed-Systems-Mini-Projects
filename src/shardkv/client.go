@@ -35,7 +35,7 @@ func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
 	var x int64
 	x = 0
-	for x == 0 {
+	for x == 0 || x == 1 {
 		bigx, _ := rand.Int(rand.Reader, max)
 		x = bigx.Int64()
 	}

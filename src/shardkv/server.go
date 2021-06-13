@@ -39,8 +39,10 @@ type ShardKV struct {
 
 	config shardctrler.Config
 	mck    *shardctrler.Clerk
+	stop   int
 
-	num int32 // merely for debugging to avoid race conditions
+	num     int32 // merely for debugging to avoid race conditions
+	counter int64 // while reconfigurations can use the config num for id, getshards that require it to stop will require to use this counter
 }
 
 const Debug = true
@@ -73,6 +75,9 @@ type Op struct {
 	Config     shardctrler.Config
 	Data       map[string]string // key -> value
 	RequestIds map[int64]int64   // Keeps track of the requests of each user to avoid repeated requests
+
+	// GetShards
+	Shards []int
 }
 
 func (kv *ShardKV) groupCheck(key string) bool {
@@ -139,12 +144,48 @@ func (kv *ShardKV) doOp(op Op) (Err, Op) {
 	}
 }
 
+func (kv *ShardKV) getDataToSend(op Op) Op {
+	set := make(map[int]bool)
+	for _, v := range op.Shards {
+		set[v] = true
+	}
+
+	op.Data = make(map[string]string)
+	op.RequestIds = make(map[int64]int64)
+
+	// add the corresponding data
+	for k, v := range kv.data {
+		if _, ok := set[key2shard(k)]; ok {
+			op.Data[k] = v
+		}
+	}
+
+	for k, v := range kv.clientIndex {
+		op.RequestIds[k] = v
+	}
+
+	return op
+}
+
 func (kv *ShardKV) applyToStateMachine(op Op) (Err, Op) {
 
 	// filter wrong group keys
-	if op.Type != "Configuration" && !kv.groupCheck(op.Key) {
-		return ErrWrongGroup, Op{}
+	if op.Type == "PutAppend" || op.Type == "Get" {
+
+		// wrong key
+		if !kv.groupCheck(op.Key) {
+			return ErrWrongGroup, Op{}
+		}
+
+		// during config change
+		if kv.stop > kv.config.Num {
+			return ErrNotUpdated, Op{}
+		} else {
+			kv.debug("Did not stop processing %v %v", kv.stop, kv.config.Num)
+		}
 	}
+
+	var status Err = OK
 
 	// update data for writes, avoid writing old data
 	if kv.clientIndex[op.ClientId] < op.RequestId {
@@ -160,9 +201,32 @@ func (kv *ShardKV) applyToStateMachine(op Op) (Err, Op) {
 		case "Configuration":
 			kv.config = op.Config
 			atomic.StoreInt32(&kv.num, int32(op.Config.Num))
-			// TODO update data
+
+			for k, v := range op.Data {
+				kv.data[k] = v
+			}
+
+			for k, v := range op.RequestIds {
+				if kv.clientIndex[k] < v && k != 0 && k != 1 {
+					kv.clientIndex[k] = v
+				}
+			}
 
 			kv.debug("Applied new configuration %v\n", op.Config)
+
+		case "GetShards":
+			// Only send data that is updated
+			if op.Config.Num-kv.config.Num <= 1 {
+				op = kv.getDataToSend(op)
+			} else {
+				status = ErrNotUpdated
+			}
+
+			// Need to stop replying to all requests until configuration updated
+			if op.Config.Num > kv.config.Num {
+				kv.stop = op.Config.Num
+				kv.debug("Stopped accepting requests")
+			}
 		default:
 			panic(fmt.Sprintf("Unrecognized command %v\n", op))
 		}
@@ -178,7 +242,7 @@ func (kv *ShardKV) applyToStateMachine(op Op) (Err, Op) {
 		}
 	}
 
-	return OK, op
+	return status, op
 }
 
 // creates the necessary data to handle new clients, usually their channels
@@ -262,9 +326,28 @@ func (kv *ShardKV) apply() {
 	}
 }
 
+func (kv *ShardKV) getCounter() int64 {
+	return atomic.AddInt64(&kv.counter, 1)
+}
+
 // Returns the shards and user indices to keep track of them
 func (kv *ShardKV) GetShards(args *GetShardsArgs, reply *GetShardsReply) {
 
+	op := Op{
+		Type:      "GetShards",
+		Config:    args.Config,
+		Shards:    args.Shards,
+		RequestId: kv.getCounter(),
+		ClientId:  1, // special id
+	}
+
+	err, res := kv.doOp(op)
+
+	reply.Err = err
+	reply.Data = res.Data
+	reply.Requests = res.RequestIds
+
+	kv.debug("GetShards ended, args=%v, reply=%v \n", args, reply)
 }
 
 func (kv *ShardKV) reconfigure(conf shardctrler.Config) {
@@ -278,11 +361,110 @@ func (kv *ShardKV) reconfigure(conf shardctrler.Config) {
 		Config:     conf,
 	}
 
+	kv.mu.Lock()
+	prevConf := kv.config
+	kv.mu.Unlock()
+
+	shards := make(map[int][]int)
+
+	// find difference in shards to request
+	for i := range conf.Shards {
+		// was in previous conf but is not in newest one
+		if conf.Shards[i] == kv.gid && conf.Shards[i] != prevConf.Shards[i] {
+			gid := prevConf.Shards[i]
+			if _, ok := shards[gid]; !ok {
+				shards[gid] = make([]int, 0)
+			}
+
+			shards[gid] = append(shards[gid], i)
+		}
+	}
+
+	// https://gobyexample.com/waitgroups
+	var wg sync.WaitGroup
+	gidChannels := make(map[int]chan map[string]string) // gid -> chan
+	userChannels := make(map[int]chan map[int64]int64)
+
+	kv.debug("Requesting %v\n", shards)
+	var stop int32 = 0
+	// get the shards values from other gids
+	for gid, neededShards := range shards {
+		// send request to each gid and get the results
+		wg.Add(1)
+		gidChannels[gid] = make(chan map[string]string, 1)
+		userChannels[gid] = make(chan map[int64]int64, 1)
+		kv.debug("Request shards %v from %v\n", shards, gid)
+		go kv.callServer(gid, neededShards, &wg, prevConf, conf, gidChannels[gid], userChannels[gid], &stop)
+	}
+
+	wg.Wait()
+
+	// Merge replies
+
+	for gid, ch := range gidChannels {
+		select {
+		case content := <-ch: // should not be blocking...
+			for k, v := range content {
+				op.Data[k] = v // we just substitute because all the data is coming and we don't have the data here (and this is the most updated one supposedly...)
+			}
+			kv.debug("Merged data %v\n", gid)
+		default:
+			kv.debug("No data for gid %v\n", gid)
+		}
+	}
+
+	for gid, ch := range userChannels {
+		select {
+		case content := <-ch:
+			for k, v := range content {
+				if op.RequestIds[k] < v {
+					op.RequestIds[k] = v // keep track of highest only
+				}
+			}
+			kv.debug("Merged users from gid %v\n", gid)
+		default:
+			kv.debug("No data for gid %v\n", gid)
+		}
+	}
+
 	kv.doOp(op)
 }
 
-func (kv *ShardKV) callServer(gid int, s []int, wg *sync.WaitGroup, prevConf, conf shardctrler.Config, gidch chan<- map[string]string, userch chan<- map[int64]int64) {
+func (kv *ShardKV) callServer(gid int, s []int, wg *sync.WaitGroup, prevConf, conf shardctrler.Config, gidch chan<- map[string]string, userch chan<- map[int64]int64, stop *int32) {
+	defer wg.Done()
 
+	args := GetShardsArgs{Shards: s, Config: conf}
+	reply := GetShardsReply{}
+
+	for { // keep trying until success
+		if servers, ok := prevConf.Groups[gid]; ok {
+			for si := 0; si < len(servers); si++ {
+				srv := kv.make_end(servers[si])
+
+				ok := srv.Call("ShardKV.GetShards", &args, &reply)
+
+				if ok && reply.Err == OK {
+					gidch <- reply.Data
+					userch <- reply.Requests
+					return
+				}
+
+				// some servers will be behind and cannot guarantee updated results
+				if ok && reply.Err == ErrNotUpdated {
+					atomic.StoreInt32(stop, 1)
+					return
+				}
+
+				kv.debug("Failed %v with error=%v ok=%v\n", servers[si], reply.Err, ok)
+			}
+		} else {
+			kv.debug("Previous config %v contains no servers in gid %v", prevConf, gid)
+			return
+		}
+
+		kv.debug("Sleeping...")
+		time.Sleep(time.Millisecond * 100)
+	}
 }
 
 // polls a new config every interval and triggers a config update if it changed
@@ -316,7 +498,7 @@ func (kv *ShardKV) loadSnapshot(data []byte) {
 
 	r := bytes.NewBuffer(data)
 	d := gob.NewDecoder(r)
-	if d.Decode(&kv.data) != nil || d.Decode(&kv.clientIndex) != nil || d.Decode(&kv.config) != nil {
+	if d.Decode(&kv.data) != nil || d.Decode(&kv.clientIndex) != nil || d.Decode(&kv.config) != nil || d.Decode(&kv.stop) != nil || d.Decode(&kv.counter) != nil {
 		panic("Error while reading snapshot in kv server")
 	}
 }
@@ -329,6 +511,8 @@ func (kv *ShardKV) makeSnapshot() []byte {
 	e.Encode(kv.data)
 	e.Encode(kv.clientIndex)
 	e.Encode(kv.config)
+	e.Encode(kv.stop)
+	e.Encode(kv.counter)
 	return w.Bytes()
 
 }
