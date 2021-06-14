@@ -196,8 +196,6 @@ func (kv *ShardKV) applyToStateMachine(op Op) (Err, Op) {
 		}
 	}
 
-	var status Err = OK
-
 	// update data for writes, avoid writing old data
 	if kv.clientIndex[op.ClientId] < op.RequestId {
 		switch op.Type {
@@ -227,21 +225,22 @@ func (kv *ShardKV) applyToStateMachine(op Op) (Err, Op) {
 				kv.config = op.Config
 			} else {
 				kv.debug("Configuration too recent, should send a previous one")
-				return ErrNotCommitted, Op{}
+				return ErrNotUpdated, Op{} // FIXME this will not happen if the request has the wrong client index
 			}
 
 		case "GetShards":
-			// Only send data that is updated
-			if op.Config.Num-kv.config.Num <= 1 {
-				op = kv.getDataToSend(op)
-			} else {
-				status = ErrNotUpdated
-			}
-
 			// Need to stop replying to all requests until configuration updated
 			if op.Config.Num >= kv.config.Num {
 				kv.stop = op.Config.Num
 				kv.debug("New stop: %v\n", kv.stop)
+			}
+
+			// Only send data that is updated
+			if op.Config.Num-kv.config.Num <= 1 {
+				op = kv.getDataToSend(op)
+				kv.debug("Data to send collected: %v, needed shards %v\n", op.Data, op.Shards)
+			} else {
+				return ErrNotUpdated, Op{}
 			}
 		default:
 			panic(fmt.Sprintf("Unrecognized command %v\n", op))
@@ -259,7 +258,7 @@ func (kv *ShardKV) applyToStateMachine(op Op) (Err, Op) {
 		kv.debug("Key=%v Shard=%v Value=%v\n", op.Key, key2shard(op.Key), op.Value)
 	}
 
-	return status, op
+	return OK, op
 }
 
 // creates the necessary data to handle new clients, usually their channels
@@ -344,7 +343,10 @@ func (kv *ShardKV) apply() {
 }
 
 func (kv *ShardKV) getCounter() int64 {
-	// return atomic.AddInt64(&kv.counter, 1)
+	// when the leader dies, if counter isn't increased either then it will run into trouble
+	if v, ok := kv.clientIndex[1]; ok && v > kv.counter {
+		kv.counter = v
+	}
 	kv.counter++
 	return kv.counter
 }
@@ -441,7 +443,7 @@ func (kv *ShardKV) reconfigure(conf shardctrler.Config) {
 		wg.Add(1)
 		gidChannels[gid] = make(chan map[string]string, 1)
 		userChannels[gid] = make(chan map[int64]int64, 1)
-		kv.debug("Request shards %v from %v\n", shards, gid)
+		kv.debug("Request shards %v from %v\n", neededShards, gid)
 		go kv.callServer(gid, neededShards, &wg, prevConf, conf, gidChannels[gid], userChannels[gid], &stop)
 	}
 
@@ -628,6 +630,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.ctrlers = ctrlers
 
 	// Your initialization code here.
+	kv.mu.Lock()
 
 	// Use something like this to talk to the shardctrler:
 	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
@@ -643,9 +646,12 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.loadSnapshot(persister.ReadSnapshot())
 
 	kv.debug("Starting %v\n", kv.me)
+	kv.mu.Unlock()
 
 	go kv.apply()
 	go kv.pollConfig()
+
+	log.SetFlags(log.Ldate | log.Lmicroseconds)
 
 	return kv
 }
