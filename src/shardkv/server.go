@@ -410,7 +410,7 @@ func (kv *ShardKV) reconfigure(conf shardctrler.Config) {
 	kv.mu.Unlock()
 
 	if prevConf.Num+1 != conf.Num {
-		panic("Oh boy here we go again")
+		return
 	}
 
 	shards := make(map[int][]int)
