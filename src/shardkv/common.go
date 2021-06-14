@@ -33,6 +33,7 @@ type PutAppendArgs struct {
 	// otherwise RPC will break.
 	RequestId int64
 	ClientId  int64
+	Config    shardctrler.Config
 }
 
 type PutAppendReply struct {
@@ -44,6 +45,7 @@ type GetArgs struct {
 	// You'll have to add definitions here.
 	RequestId int64
 	ClientId  int64
+	Config    shardctrler.Config
 }
 
 type GetReply struct {
