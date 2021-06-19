@@ -31,6 +31,7 @@ type ShardKV struct {
 	ctrlers      []*labrpc.ClientEnd
 	maxraftstate int // snapshot if log grows this big
 	lastIndex    int
+	dead         int32
 
 	// Your definitions here.
 	data        map[string]string
@@ -136,6 +137,7 @@ func (kv *ShardKV) doOp(op Op) (Err, Op) {
 		select {
 		case response := <-readCh:
 			if response.Index != index {
+				kv.debug("Message failed because indices were differente: %v %v\n", response.Index, index)
 				return ErrNotCommitted, Op{}
 			}
 
@@ -281,7 +283,7 @@ func (kv *ShardKV) checkNewClient(clientId int64) chan Result {
 
 // Receives commands from raft and applies them to the state machine
 func (kv *ShardKV) apply() {
-	for {
+	for !kv.killed() {
 		msg := <-kv.applyCh // new message committed in raft
 		kv.debug("New message #%v to apply %v\n", msg.CommandIndex, msg)
 		start := time.Now()
@@ -375,6 +377,7 @@ func (kv *ShardKV) GetShards(args *GetShardsArgs, reply *GetShardsReply) {
 		select {
 		case response := <-ch:
 			if response.Index != index {
+				kv.debug("Message failed because indices were differente: %v %v\n", response.Index, index)
 				err = ErrNotCommitted
 			} else {
 				err = response.Err
@@ -482,7 +485,9 @@ func (kv *ShardKV) reconfigure(conf shardctrler.Config) {
 		}
 	}
 
-	kv.doOp(op)
+	ok, res := kv.doOp(op)
+	kv.debug("Reconfiguration result: %v %v\n", ok, res)
+
 }
 
 func (kv *ShardKV) callServer(gid int, s []int, wg *sync.WaitGroup, prevConf, conf shardctrler.Config, gidch chan<- map[string]string, userch chan<- map[int64]int64, stop *int32) {
@@ -491,7 +496,7 @@ func (kv *ShardKV) callServer(gid int, s []int, wg *sync.WaitGroup, prevConf, co
 	args := GetShardsArgs{Shards: s, Config: conf}
 	reply := GetShardsReply{}
 
-	for { // keep trying until success
+	for !kv.killed() { // keep trying until success
 		if servers, ok := prevConf.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := kv.make_end(servers[si])
@@ -526,7 +531,7 @@ func (kv *ShardKV) callServer(gid int, s []int, wg *sync.WaitGroup, prevConf, co
 func (kv *ShardKV) pollConfig() {
 	const duration = time.Millisecond * 100
 
-	for {
+	for !kv.killed() {
 		time.Sleep(duration)
 
 		if !kv.rf.IsLeader() {
@@ -589,6 +594,11 @@ func (kv *ShardKV) Kill() {
 	kv.debug("Killed %v\n", kv.me)
 }
 
+func (kv *ShardKV) killed() bool {
+	z := atomic.LoadInt32(&kv.dead)
+	return z == 1
+}
+
 //
 // servers[] contains the ports of the servers in this group.
 //
@@ -642,6 +652,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.results = make(map[int64]chan Result) // this to ease the reply mechanism
 	kv.clientIndex = make(map[int64]int64)   // this keeps track of the index of the last operation done by the client
 	kv.lastIndex = -1
+	kv.dead = 0
 
 	kv.loadSnapshot(persister.ReadSnapshot())
 

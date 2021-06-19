@@ -32,7 +32,7 @@ import (
 	"6.824/labrpc"
 )
 
-var DEBUG = false
+var DEBUG = true
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -84,7 +84,6 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 	applyCh   chan ApplyMsg
-
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -239,9 +238,9 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if rf.lastIncludedIndex > 0 {
 		trimIndex -= 1
 	}
-	rf.log = append([]JobEntry(nil), rf.log[trimIndex+1:]...)
+	rf.lastIncludedTerm = rf.index(index).Term
 	rf.lastIncludedIndex = index
-	rf.lastIncludedTerm = rf.index(rf.lastEntryIndex()).Term
+	rf.log = append([]JobEntry(nil), rf.log[trimIndex+1:]...)
 	rf.snapshot = snapshot
 
 	rf.debug("Updated to snapshot. lastIncludedIndex=%v, logsize=%v\n", rf.lastIncludedIndex, len(rf.log))
@@ -768,8 +767,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return
 	}
 
-	if args.LastIncludedIndex <= rf.lastIncludedIndex {
-		rf.debug("Outdated InstallSnapshot. args=%v, rf=%v\n", args.LastIncludedIndex, rf.lastIncludedIndex)
+	if args.LastIncludedIndex < rf.commitIndex {
+		rf.debug("Outdated InstallSnapshot. args=%v, rf=%v\n", args.LastIncludedIndex, rf.commitIndex)
 		return
 	}
 
