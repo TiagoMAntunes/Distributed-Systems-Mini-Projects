@@ -46,7 +46,7 @@ type ShardKV struct {
 	counter int64 // while reconfigurations can use the config num for id, getshards that require it to stop will require to use this counter
 }
 
-const Debug = true
+const Debug = false
 
 func (kv *ShardKV) debug(format string, a ...interface{}) (n int, err error) {
 	if Debug {
